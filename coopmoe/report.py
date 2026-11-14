@@ -11,17 +11,17 @@ def _f(x, fmt="{:.2f}") -> str:
 
 
 def cell_table(rows: list[dict]) -> str:
-    head = ("cell", "tok/s", "tpot p50 ms", "tpot p95 ms", "ttft s", "e2e p50 s", "e2e p95 s", "wait s",
-            "local", "peer", "nvme", "admits", "overlap", "turns A/B", "nvme GB/s", "link GB/s", "err")
+    head = ("cell", "run s", "run tok/s", "tok/s", "tpot p50 ms", "tpot p95 ms", "ttft s", "e2e p50 s", "e2e p95 s", "wait s",
+            "local", "peer", "nvme", "overlap", "turns A/B", "nvme GB/s", "link GB/s", "err")
     lines = [" | ".join(head), " | ".join("---" for _ in head)]
     for r in rows:
         s = r["summary"]
         d = s.get("decode_sources") or {}
         lines.append(" | ".join([
-            r["tag"], _f(s["tok_s"]), _f(s["tpot_ms_p50"], "{:.1f}"), _f(s["tpot_ms_p95"], "{:.1f}"),
+            r["tag"], _f(s.get("run_s"), "{:.1f}"), _f(s.get("run_tok_s")), _f(s["tok_s"]), _f(s["tpot_ms_p50"], "{:.1f}"), _f(s["tpot_ms_p95"], "{:.1f}"),
             _f(s["ttft_s_mean"]), _f(s.get("e2e_s_p50")), _f(s.get("e2e_s_p95")), _f(s.get("wait_s_mean")),
             _f(d.get("local")), _f(d.get("peer")),
-            _f((d.get("nvme") or 0) + (d.get("nvme_tmp") or 0)), str(s.get("admitted_from_peer", 0)),
+            _f((d.get("nvme") or 0) + (d.get("nvme_tmp") or 0)),
             _f(s.get("overlap_jaccard_mean")), "/".join(str(t) for t in s.get("turns_per_box", [])),
             _f(s.get("nvme_gb_s"), "{:.3f}"), _f(s.get("link_gb_s"), "{:.3f}"),
             str(s.get("errors", 0))]))

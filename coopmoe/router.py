@@ -1,10 +1,10 @@
 """Request scheduler (runs next to PGX-A's engine): decides which box serves each request.
 Never touches weights or KV.
 
-Every request carries a category label (code, math, medicine, ...), and the run config fixes
-which categories each box serves (router.box_categories). Two modes:
+Every request carries the box make_requests.py assigned it to ("box", by its category). Two
+modes:
 
-  category     a request goes to the box that serves its category
+  category     a request goes to its assigned box
   round_robin  baseline: requests alternate between the boxes in arrival order, whatever
                their category
 
@@ -18,24 +18,11 @@ from __future__ import annotations
 
 import threading
 from collections import Counter
-from typing import Callable, Optional
+from typing import Callable
 
 from coopmoe.config import RouterConfig
 
 MODES = ("category", "round_robin")
-
-
-def box_of_category(box_categories: list) -> dict[str, int]:
-    """[[categories of box 0], [categories of box 1]] -> {category: box}."""
-    if len(box_categories) != 2:
-        raise ValueError(f"router.box_categories needs two lists (box 0, box 1), got {box_categories!r}")
-    out: dict[str, int] = {}
-    for box, cats in enumerate(box_categories):
-        for c in cats:
-            if c in out:
-                raise ValueError(f"category {c!r} is assigned to both boxes")
-            out[c] = box
-    return out
 
 
 class Router:
@@ -45,7 +32,6 @@ class Router:
         if rcfg.mode not in MODES:
             raise ValueError(f"router.mode must be one of {MODES}, got {rcfg.mode!r}")
         self.cfg, self.cap, self.call, self.log = rcfg, cap, call, log
-        self.box_of = box_of_category(rcfg.box_categories)
         self.slots = [threading.Semaphore(cap), threading.Semaphore(cap)]
         self.lock = threading.Lock()
         self.sessions: dict[str, int] = {}   # open session -> its box
@@ -53,16 +39,17 @@ class Router:
         self.stats = Counter()
         self.placement = Counter()           # "code->0": category and where it went
 
-    def assign(self, category: Optional[str]) -> int:
+    def assign(self, request: dict) -> int:
         """The scheduling decision, made once per request in arrival order."""
+        category = request.get("category")
         with self.lock:
             if self.cfg.mode == "round_robin":
                 box = self.arrivals % 2
-            elif category in self.box_of:
-                box = self.box_of[category]
+            elif request.get("box") in (0, 1):
+                box = request["box"]
             else:
-                raise ValueError(f"no box serves category {category!r}; router.box_categories has "
-                                 f"{sorted(self.box_of)}")
+                raise ValueError(f"request {request.get('id')!r} has no box: regenerate the requests "
+                                 f"with make_requests.py")
             self.arrivals += 1
             self.placement[f"{category}->{box}"] += 1
             return box

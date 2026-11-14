@@ -8,19 +8,25 @@ Run it anywhere the `fuzzball` CLI is logged in to the cluster.
 
 --volume is a model's NFS volume, made once beforehand by stage.py (team1/coopmoe-<model>).
 Each volume holds one model's expert store, so its name says which model to run. Then:
-  1. select   --num requests for each box (default 64, so 128 in all): box 0's from its
-              categories, box 1's from its own, spread evenly over each side's categories.
+  1. select   --num requests for each box (default 64, so 128 in all), from the requests
+              make_requests.py assigned to that box ("box"), spread evenly over its categories.
               Each box serves --concurrency of them at a time, batched (default: the run
               config's engine.max_sessions, 4); more needs more memory for KV caches
-  2. render   fuzzball/coopmoe.fz: one two-node job that carries this repo's code and the
-              selected requests (fuzzball/bootstrap.sh runs on each node)
-  3. submit   fuzzball workflow validate + start
-  4. inside   both nodes copy the expert store from the volume to their own NVMe and
-     the job  start their engine; PGX-A runs the requests through the scheduler with the model's
-              run config as it is (configs/), and prints the results into the job log
-  5. collect  follows the job log, then writes the results to results/<model>-<time>/:
+  2. render   fuzzball/coopmoe.fz twice, one single-node job per box (a multinode job cannot
+              mount a node's NVMe): box 0 runs the experiment, box 1 serves as its peer. Each
+              carries this repo's code; box 0's also carries the selected requests
+  3. submit   fuzzball workflow validate + start, both at once
+  4. inside   each job writes its node's CX-7 address to the NFS volume and waits for the
+     the jobs other's (fuzzball/bootstrap.sh, rendezvous), copies the expert store from the volume
+              to its own NVMe and starts its engine; box 0 runs the requests through the
+              scheduler with the model's run config as it is (configs/), prints the results
+              into its job log and stops both engines
+  5. collect  follows both job logs, then writes the results to results/<model>-<time>/:
               report.md (throughput, TTFT, TPOT, latency, where experts came from), <setup>.json,
-              <setup>_outputs.jsonl (one line per request), requests.json, coopmoe.fz, job.log
+              <setup>_outputs.jsonl (one line per request), requests.json, box0.fz, box1.fz,
+              job.log (box 0), box1.log
+     If box 1's job does not start (Fuzzball sometimes puts both jobs' scratch volumes on one
+     node), box 0 gives up after SETTINGS rendezvous seconds and both jobs are submitted again.
 
 Everything else is fixed in SETTINGS below. To change the engines or the scheduler (cache.gb,
 link, router mode), edit the model's run config. experiment() is the same thing as a function,
@@ -38,6 +44,7 @@ import shlex
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from collections import Counter
 
@@ -46,7 +53,7 @@ sys.path.insert(0, REPO)
 
 from coopmoe.config import load_run_config  # noqa: E402
 from coopmoe.report import render, write_cell  # noqa: E402
-from coopmoe.workload import select  # noqa: E402
+from make_requests import select  # noqa: E402
 
 # The two models the configs are written for: short name -> (Hub repo, run config).
 MODELS = {
@@ -61,7 +68,8 @@ SETTINGS = dict(
     image="docker://nvcr.io/nvidia/pytorch:25.09-py3",
     gpus=1, cores=20, memory="120GiB",               # a whole GB10 box (unified memory: a hard limit)
     timeout="24h",
-    boxes=["run-0:29600", "run-1:29600"],            # the engines, by the job's hostnames
+    port=29600, rendezvous=120,                      # the engines' port; seconds a box waits for the other box's job
+    cx7_net="10.10.11.1",                            # an address on the CX-7 network (the NFS server): picks each box's CX-7 address
     fuzzball="fuzzball", poll=15.0,                  # the CLI, seconds between status checks
 )
 # What the job needs of this repo (shipped inside the workflow).
@@ -100,13 +108,19 @@ def store_paths(repo: str) -> dict:
 
 
 # ---------------------------------------------------------------------- the workflow
-def code_archive() -> str:
-    """This repo's code as base64 tar.gz."""
+def code_archive(requests: list[dict]) -> str:
+    """This repo's code and the run's requests (requests.json) as base64 tar.gz. Base64 because
+    Fuzzball treats a double brace anywhere in a workflow file as a template, and requests
+    contain them."""
     buf = io.BytesIO()
     skip = lambda ti: None if "__pycache__" in ti.name or ti.name.endswith(".pyc") else ti  # noqa: E731
     with tarfile.open(fileobj=buf, mode="w:gz") as t:
         for name in CODE:
             t.add(os.path.join(REPO, name), arcname=name, filter=skip)
+        data = json.dumps(requests, ensure_ascii=False).encode()
+        info = tarfile.TarInfo("requests.json")
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
     return base64.encodebytes(buf.getvalue()).decode()
 
 
@@ -125,34 +139,36 @@ def block(text: str, indent: int = 4) -> str:
     return "\n".join(pad + line if line else "" for line in text.rstrip("\n").split("\n"))
 
 
-def bootstrap(short: str, sets: str = "", boxes: str = "''", run_args: str = "") -> str:
-    """fuzzball/bootstrap.sh for this model."""
+def bootstrap(short: str, run_id: str = "", run_args: str = "") -> str:
+    """fuzzball/bootstrap.sh for this model. run_id names the directory on the NFS volume where
+    the two boxes of a linked run find each other."""
     repo, config = MODELS[short]
     p, q = store_paths(repo), shlex.quote
     with open(os.path.join(REPO, "fuzzball", "bootstrap.sh")) as f:
         return fill(f.read(), {
             "MODEL": q(repo), "NFS_STORE": q(p["nfs_store"]), "STORE": q(p["store"]), "HF_DIR": q(p["hf"]),
-            "CONFIG": q(config), "BIND1": "0.0.0.0", "SETS": sets, "RESULTS": f"{p['data']}/results",
-            "BOXES": boxes, "RUN_ARGS": run_args})
+            "CONFIG": q(config), "RESULTS": f"{p['data']}/results", "RUN_ARGS": run_args,
+            "RDV": q(f"{p['data']}/rendezvous/{run_id}"), "PORT": str(S.port), "CX7_NET": S.cx7_net, "RDV_TIMEOUT": str(S.rendezvous)})
 
 
-def job_values(short: str, timeout: str) -> dict:
+def job_values(short: str, timeout: str, requests: list[dict] = ()) -> dict:
     """The placeholders both workflows share."""
     p = store_paths(MODELS[short][0])
-    return {"CODE": block(code_archive()), "DATA": p["data"], "LOCAL": p["local"], "TIMEOUT": timeout,
+    return {"CODE": block(code_archive(list(requests))), "DATA": p["data"], "LOCAL": p["local"], "TIMEOUT": timeout,
             "VOLUME_USE": S.provisioner, "VOLUME": volume_name(short), "IMAGE": S.image,
             "CORES": str(S.cores), "MEMORY": S.memory, "SCRATCH": S.scratch}
 
 
-def render_workflow(short: str, picked: list[dict], cells: list) -> str:
-    p, q = store_paths(MODELS[short][0]), shlex.quote
-    sets = [f"store_dir={p['store']}", f"cluster.addrs={json.dumps(S.boxes)}"]  # for engine rank 1
+def render_box(short: str, role: str, run_id: str, picked: list[dict], cells: list) -> str:
+    """fuzzball/coopmoe.fz for one box. role: run (box 0: its engine and the experiment) or
+    engine (box 1). picked: the requests (box 0's job runs them all through the scheduler);
+    cells: [(tag, [KEY=VALUE, ...]), ...], for run."""
+    q = shlex.quote
     run_args = [a for c in cells for a in ("--cell", " ".join([c[0], *c[1]]))]
-    boot = bootstrap(short, " ".join(q(s) for s in sets), q(",".join(S.boxes)), " ".join(q(a) for a in run_args))
-    requests = "[\n" + ",\n".join(json.dumps(r) for r in picked) + "\n]"  # ASCII: safe in a YAML block
+    boot = bootstrap(short, run_id, " ".join(q(a) for a in run_args))
     with open(os.path.join(REPO, "fuzzball", "coopmoe.fz")) as f:
-        return fill(f.read(), {"BOOTSTRAP": block(boot), "REQUESTS": block(requests), "GPUS": str(S.gpus),
-                               **job_values(short, S.timeout)})
+        return fill(f.read(), {"BOOTSTRAP": block(boot), "GPUS": str(S.gpus), "ROLE": role,
+                               **job_values(short, S.timeout, picked)})
 
 
 # ---------------------------------------------------------------------- fuzzball
@@ -168,13 +184,13 @@ def status(wid: str) -> str:
     return m.group(1) if m else "?"
 
 
-def follow(wid: str, job: str) -> str:
+def follow(wid: str, job: str, prefix: str = "") -> str:
     """Streams the job's log until the workflow ends. -> its final status."""
     last = None
     while True:
         st = status(wid)
         if st != last:
-            log(f"workflow {wid}: {st}")
+            log(f"{prefix}workflow {wid}: {st}")
             last = st
         if st in DONE:
             return st
@@ -183,13 +199,13 @@ def follow(wid: str, job: str) -> str:
                                  stderr=subprocess.STDOUT, text=True)
             for line in p.stdout:
                 if MARK not in line:
-                    print(line, end="", flush=True)
+                    print(prefix + line, end="", flush=True)
             p.wait()
         time.sleep(S.poll)
 
 
-def submit(wf: str, path: str, job: str) -> tuple[str, str]:
-    """Writes, validates, starts and follows a workflow. -> (workflow id, final status)."""
+def start(wf: str, path: str) -> str:
+    """Writes, validates and starts a workflow. -> its id."""
     with open(path, "w") as f:
         f.write(wf)
     log(f"workflow: {path} ({len(wf) / 1e3:.0f} kB)")
@@ -198,8 +214,13 @@ def submit(wf: str, path: str, job: str) -> tuple[str, str]:
     m = UUID.search(started)
     if not m:
         raise SystemExit(f"no workflow id in: {started}")
-    wid = m.group(0)
-    log(f"started workflow {wid}; Ctrl-C stops it")
+    log(f"started workflow {m.group(0)}; Ctrl-C stops it")
+    return m.group(0)
+
+
+def submit(wf: str, path: str, job: str) -> tuple[str, str]:
+    """Writes, validates, starts and follows a workflow. -> (workflow id, final status)."""
+    wid = start(wf, path)
     try:
         return wid, follow(wid, job)
     except KeyboardInterrupt:
@@ -208,43 +229,96 @@ def submit(wf: str, path: str, job: str) -> tuple[str, str]:
         raise
 
 
+def run_pair(wfs: list[str], paths: list[str], until_box0: bool) -> tuple[list[str], list]:
+    """Starts one workflow per box, both at once, and follows both job logs. until_box0: the
+    run is over when box 0's workflow ends (box 1 only serves, and is stopped if it is still
+    there a minute later); otherwise it waits for both. Ctrl-C or a failed start stops whatever
+    was started. -> (workflow ids, final statuses)."""
+    wids: list[str] = []
+    finals: list = [None, None]
+
+    def watch(b: int) -> None:
+        finals[b] = follow(wids[b], "run", prefix=f"[box{b}] ")
+
+    try:
+        for wf, path in zip(wfs, paths):
+            wids.append(start(wf, path))
+        threads = [threading.Thread(target=watch, args=(b,), daemon=True) for b in (0, 1)]
+        for t in threads:
+            t.start()
+        while threads[0].is_alive():
+            threads[0].join(timeout=1.0)
+        t0 = time.time()
+        while threads[1].is_alive():
+            if until_box0 and time.time() - t0 > 60:
+                log(f"box 0's workflow ended {finals[0]}; stopping box 1's workflow {wids[1]}")
+                fuzzball("workflow", "stop", wids[1], check=False)
+                until_box0 = False
+            threads[1].join(timeout=1.0)
+    except BaseException:
+        for wid in wids:
+            log(f"stopping workflow {wid}")
+            fuzzball("workflow", "stop", wid, check=False)
+        raise
+    return wids, finals
+
+
 def collect(job_log: str) -> tuple[list[dict], dict[str, list[dict]]]:
-    """'@@coopmoe' lines of the job log -> (results per setup, outputs per setup)."""
+    """'@@coopmoe <kind> <i>/<n> <base64 chunk>' lines of the job log (run.py, _emit) ->
+    (results per setup, outputs per setup)."""
     cells, outputs = [], {}
+    parts: list[str] = []
     for line in job_log.splitlines():
         i = line.find(MARK + " ")
         if i < 0:
             continue
-        kind, _, payload = line[i + len(MARK) + 1:].partition(" ")
+        fields = line[i + len(MARK) + 1:].split(" ")
+        if len(fields) != 3 or "/" not in fields[1]:
+            continue  # same-node and other plain markers
+        kind, pos, chunk = fields
+        k, n = (int(x) for x in pos.split("/"))
+        if k == 1:
+            parts = []
+        parts.append(chunk.strip())
+        if k < n:
+            continue
+        obj = json.loads(base64.b64decode("".join(parts)).decode())
         if kind == "cell":
-            cells.append(json.loads(payload))
+            cells.append(obj)
         elif kind == "output":
-            o = json.loads(payload)
-            outputs.setdefault(o["cell"], []).append(o)
+            outputs.setdefault(obj["cell"], []).append(obj)
     return cells, outputs
 
 
 # ---------------------------------------------------------------------- the experiment
-def experiment(volume: str, requests: str, num: int = 64, concurrency: int | None = None,
-               cells: list | None = None) -> tuple[str, list[dict]]:
-    """One Fuzzball job: num requests per box from the requests file, run on the model in volume,
-    each box serving `concurrency` of them at a time, batched (default: the run config's
-    engine.max_sessions). cells: [(tag, [KEY=VALUE, ...]), ...] setups to run one after another in
-    that job; default is the run config as it is. -> (results directory, results per setup)."""
+def plan(volume: str, requests: str, num: int, concurrency: int | None):
+    """What a linked run and its baseline share: the model, its run config, the same selected
+    requests and the per-box concurrency. -> (short name, run config, picked requests, concurrency)."""
     short = volume_model(volume)
     repo, config = MODELS[short]
     cfg = load_run_config(os.path.join(REPO, config), [])
     log(f"volume {S.provisioner}/{volume} -> model {repo}")
     with open(requests, encoding="utf-8") as f:
-        picked = select(json.load(f), cfg.router.box_categories, 2 * num)
-    sides = cfg.router.box_categories
-    log(f"{len(picked)} requests ({num} per box) from {requests}: "
-        + ", ".join(f"{c} {n}" for c, n in Counter(r["category"] for r in picked).items()))
-    log(f"box 0 serves {', '.join(sides[0])}; box 1 serves {', '.join(sides[1])}")
+        picked = select(json.load(f), num)
+    log(f"{len(picked)} requests ({num} per box, as make_requests.py assigned them) from {requests}")
+    for b in (0, 1):
+        log(f"box {b}: " + ", ".join(f"{c} {n}" for c, n in Counter(r["category"] for r in picked if r["box"] == b).items()))
     conc = cfg.engine.max_sessions if concurrency is None else concurrency
     if conc < 1:
         raise SystemExit(f"concurrency must be at least 1, got {conc}")
     log(f"each box serves {conc} requests at a time")
+    return short, cfg, picked, conc
+
+
+def experiment(volume: str, requests: str, num: int = 64, concurrency: int | None = None,
+               cells: list | None = None) -> tuple[str, list[dict]]:
+    """One linked run, as two single-node Fuzzball jobs (one per box) that talk over the CX-7
+    link: num requests per box from the requests file, run on the model in volume, each box
+    serving `concurrency` of them at a time, batched (default: the run config's
+    engine.max_sessions). cells: [(tag, [KEY=VALUE, ...]), ...] setups to run one after another in
+    those jobs; default is the run config as it is. -> (results directory, results per setup)."""
+    short, cfg, picked, conc = plan(volume, requests, num, concurrency)
+    repo = MODELS[short][0]
     if cells is None:
         mode, link = cfg.router.mode, cfg.link.enabled
         cells = [(f"{'linked' if link else 'indep'}_{'cat' if mode == 'category' else 'rr'}", [])]
@@ -252,20 +326,33 @@ def experiment(volume: str, requests: str, num: int = 64, concurrency: int | Non
     per_box = [f"engine.max_sessions={conc}", f"engine.max_batch={conc}"]
     cells = [(tag, per_box + list(overrides)) for tag, overrides in cells]
 
-    out = os.path.join(REPO, "results", f"{short}-{time.strftime('%Y%m%d-%H%M%S')}")
+    run_id = f"{short}-{time.strftime('%Y%m%d-%H%M%S')}"
+    out = os.path.join(REPO, "results", run_id)
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "requests.json"), "w", encoding="utf-8") as f:
         json.dump(picked, f, ensure_ascii=False, indent=1)
-    wid, final = submit(render_workflow(short, picked, cells), os.path.join(out, "coopmoe.fz"), "run")
-    job_log = fuzzball("workflow", "log", wid, "run", check=False)
+    # Fuzzball decides which node each job's scratch volume lands on. When both land on one
+    # node the second job cannot start; the jobs notice (bootstrap.sh, rendezvous) and it is
+    # submitted again.
+    for attempt in range(1, 7):
+        rdv = f"{run_id}-{attempt}"
+        wfs = [render_box(short, "run", rdv, picked, cells), render_box(short, "engine", rdv, [], [])]
+        wids, finals = run_pair(wfs, [os.path.join(out, f"box{b}.fz") for b in (0, 1)], until_box0=True)
+        final = finals[0]
+        job_log = fuzzball("workflow", "log", wids[0], "run", check=False)
+        if f"{MARK} same-node" not in job_log:
+            break
+        log(f"attempt {attempt}: both jobs were placed on one node; submitting again")
     with open(os.path.join(out, "job.log"), "w") as f:
         f.write(job_log)
+    with open(os.path.join(out, "box1.log"), "w") as f:
+        f.write(fuzzball("workflow", "log", wids[1], "run", check=False))
     results, outputs = collect(job_log)
     for res in results:
         write_cell(out, res, outputs.get(res["tag"], []))
         res["turns"] = outputs.get(res["tag"], [])
     if final != "STAGE_STATUS_FINISHED" or len(results) < len(cells):
-        log(f"workflow ended {final} with {len(results)} of {len(cells)} setups; see {out}/job.log")
+        log(f"box 0's workflow ended {final} with {len(results)} of {len(cells)} setups; see {out}/job.log and box1.log")
     if results:
         with open(os.path.join(out, "report.md"), "w") as f:
             f.write(f"# {repo}\n\n" + render(results, os.path.join(out, "overlap.csv")))

@@ -1,20 +1,20 @@
-# One CoopMoE experiment on the team's two PGX boxes (DGX Spark, GB10), as a Fuzzball workflow
-# (v4 syntax). driver.py fills in every double-brace placeholder, saves the result next to the
-# run's results as coopmoe.fz, validates it and starts it.
+# ONE box of a CoopMoE experiment on the team's two PGX boxes (DGX Spark, GB10), as a
+# single-node Fuzzball workflow (v4 syntax). driver.py fills in every double-brace placeholder
+# and starts it twice, once per box, at the same time:
+#   run     box 0 (PGX-A): starts box 0's engine, runs the requests through the scheduler,
+#           prints the results into this job's log
+#   engine  box 1 (PGX-B): serves as box 1 until box 0 stops it
+# Two jobs instead of one two-node job because Fuzzball refuses a multinode job that mounts a
+# node-local volume (the box's NVMe). run and engine find each other through the NFS volume and
+# talk over the CX-7 link (fuzzball/bootstrap.sh, rendezvous).
+# The code and the requests travel inside the workflow (code.tgz.b64), so the job needs no git access.
 #
-# One multinode job, two nodes, implementation "generic":
-#   rank 0 (PGX-A): copies the store to its local disk, starts box 0's engine, runs the
-#                   requests through the scheduler, prints the results into this job's log
-#   rank 1 (PGX-B): copies the store to its local disk, serves as box 1 until rank 0 stops it
-# The code and the requests travel inside the workflow (files:), so the job needs no git access.
-#
-# Storage, as found on fb-hack (README, "The cluster"):
-#   data   the team's persistent volume: NFS (10.10.11.1:/hackathon/team-01), the SAME files
-#          on both boxes. Holds the one expert store (built once by fuzzball/stage.fz), the
-#          calibration files and the results.
-#   scratch  each node's own NVMe (a hostpath volume: /dev/nvme0n1p2 on the node), wiped when
-#          the job ends. Each box copies the store here at job start and reads its expert
-#          misses from it, as the design assumes.
+#   data     the model's persistent volume: NFS (10.10.11.1:/hackathon/team-01), the SAME files
+#            on both boxes. Holds the one expert store (built once by fuzzball/stage.fz), the
+#            rendezvous files and the results.
+#   scratch  this node's own NVMe (a hostpath volume: /dev/nvme0n1p2 on the node), wiped when
+#            the job ends. The box copies the store here at job start and reads its expert
+#            misses from it.
 version: v4
 
 files:
@@ -22,8 +22,6 @@ files:
 {{BOOTSTRAP}}
   code.tgz.b64: |
 {{CODE}}
-  requests.json: |
-{{REQUESTS}}
 
 volumes:
   data:
@@ -38,17 +36,12 @@ jobs:
       uri: {{IMAGE}}
     script: |
       #!/bin/bash
-      . /multinode/generic-helper
-      exec_rank0 "bash /opt/coopmoe/bootstrap.sh run"
-      exec_rankN "bash /opt/coopmoe/bootstrap.sh engine"
-      wait_rank0
+      bash /opt/coopmoe/bootstrap.sh {{ROLE}}
     env:
-      - MULTINODE_WRAPPER_FORWARD_STREAMS=1
       - HF_HOME={{DATA}}/hf-cache
     files:
       /opt/coopmoe/bootstrap.sh: file://bootstrap.sh
       /opt/coopmoe/code.tgz.b64: file://code.tgz.b64
-      /opt/coopmoe/requests.json: file://requests.json
     mounts:
       {{DATA}}: data
       {{LOCAL}}: scratch
@@ -63,9 +56,6 @@ jobs:
       devices:
         nvidia.com/gpu: {{GPUS}}
       exclusive: true
-    multinode:
-      nodes: 2
-      implementation: generic
     policy:
       timeout:
         execute: {{TIMEOUT}}

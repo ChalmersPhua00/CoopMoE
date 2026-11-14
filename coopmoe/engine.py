@@ -20,7 +20,7 @@ thread.
 
 Ops (TcpServer -> Box.handle):
     scheduler: turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
-    peer:   compute, fetch, bitmap
+    peer:   compute, bitmap
 """
 from __future__ import annotations
 
@@ -39,7 +39,7 @@ from coopmoe import model as hf_model
 from coopmoe.cache import ExpertCache
 from coopmoe.config import RunConfig, apply_overrides
 from coopmoe.moe import MoeExecutor
-from coopmoe.peer import Admitter, PeerLink
+from coopmoe.peer import PeerLink
 from coopmoe.stats import Counters
 from coopmoe.store.layout import FP8, StoreIndex
 from coopmoe.store.reader import BufferPool, ExpertLoader, ExpertReader
@@ -80,7 +80,6 @@ class Box:
         self.cache: Optional[ExpertCache] = None
         self.transients: Optional[BufferPool] = None
         self._configure(cfg)
-        self.admitter = Admitter(self)
         self.model.register_forward_pre_hook(self._before_step, with_kwargs=True)
         self.model.register_forward_hook(self._after_step)
         self.cb = self._start_cb(cfg)
@@ -119,10 +118,42 @@ class Box:
                                        max_batch_tokens=e.max_seq, max_requests_per_batch=e.max_batch,
                                        use_cuda_graph=False, use_async_batching=False, allow_block_sharing=False,
                                        auto_switch_to_flash=False)
+        # HF's KV footprint is ~1.5x the KV itself (masks, batch tensors); it must fit in 0.9 x free.
+        self._make_room(int((1.6 * e.max_sessions * self.kv_bytes_per_request() + 2**30) / 0.9))
         cb = self.model.init_continuous_batching(generation_config=gen, continuous_batching_config=cbc)
         cb.start()
+        t0 = time.time()
+        while cb.batch_processor is None:  # set by the loop thread once its KV cache exists
+            if not cb.is_running():
+                raise RuntimeError("HF's generation loop failed to start (its error is logged above)")
+            if time.time() - t0 > 600:
+                raise RuntimeError("HF's generation loop did not start within 600 s")
+            time.sleep(0.05)
         self.cb_cfg = cfg
         return cb
+
+    def _make_room(self, nbytes: int) -> None:
+        """On the GB10 (unified memory) cudaMemGetInfo's "free" leaves out the page cache, although
+        an allocation reclaims it. HF sizes and checks its KV cache against that "free", so on a
+        node whose page cache is full (the store copy alone adds ~32-226 GB) it refuses to start.
+        Allocating and touching nbytes once makes the kernel reclaim that much; freeing it leaves it
+        free for HF's check."""
+        if self.device.type != "cuda":
+            return
+        free, _ = torch.cuda.mem_get_info(self.device)
+        if free >= nbytes:
+            return
+        try:
+            x = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            x.fill_(0)
+            torch.cuda.synchronize(self.device)
+            del x
+        except torch.OutOfMemoryError:
+            self.log(f"[box{self.rank}] could not reclaim {nbytes / 2**30:.1f} GiB for the KV cache")
+        torch.cuda.empty_cache()
+        after, _ = torch.cuda.mem_get_info(self.device)
+        self.log(f"[box{self.rank}] free memory {free / 2**30:.1f} -> {after / 2**30:.1f} GiB "
+                 f"(reclaimed page cache for the KV cache, wanted {nbytes / 2**30:.1f} GiB)")
 
     @staticmethod
     def _cb_key(cfg: RunConfig) -> tuple:
@@ -167,8 +198,7 @@ class Box:
     # ------------------------------------------------------------------ peer link
     def _open_peer(self) -> None:
         addr, t = self.cfg.cluster.addrs[1 - self.rank], self.cfg.cluster.connect_timeout
-        layer_client, bg_client = TcpClient(addr, t), TcpClient(addr, t)  # layer requests, admission fetches
-        self.peer = PeerLink(self, layer_client, bg_client, self.epoch)
+        self.peer = PeerLink(self, TcpClient(addr, t), self.epoch)
         self.cache.set_peer(None)
 
     def _close_peer(self) -> None:
@@ -189,8 +219,6 @@ class Box:
         if op == "compute":
             with torch.inference_mode():
                 return self.moe.serve_compute(h, tensors)
-        if op == "fetch":
-            return self.moe.serve_fetch(h)
         if op == "bitmap":
             if self.peer is not None:
                 self.peer.receive_bitmap(int(h["epoch"]), int(h["version"]), tensors[0])
@@ -279,7 +307,6 @@ class Box:
     # ------------------------------------------------------------------ control ops
     def _quiesce(self) -> None:
         """Stop using and serving the link (first half of a reset across both boxes)."""
-        self.admitter.drain()
         self._close_peer()
 
     def _reset(self, overrides: list, epoch: int) -> None:
@@ -289,7 +316,6 @@ class Box:
         self._quiesce()
         cfg = apply_overrides(self.base_cfg.copy(), overrides)
         self._configure(cfg)
-        self.admitter.k, self.admitter.window = cfg.cache.admit_k, cfg.cache.admit_window
         self.epoch = epoch
         self.step = 0
         self.reset_counters()
@@ -327,7 +353,6 @@ class Box:
         self.cb.stop(block=True, hard_stop=True)
         self._stop = True
         self.stopped.wait(timeout=10)
-        self.admitter.close()
         self._close_peer()
         if self.server is not None:
             self.server.close()

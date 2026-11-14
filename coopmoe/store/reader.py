@@ -119,7 +119,7 @@ class ExpertLoader:
                 self._cv.notify()
 
     def copy_in(self, dst: torch.Tensor, src: torch.Tensor) -> None:
-        """Host bytes -> a device slot, synchronously (used for drive reads and peer fetches)."""
+        """Host bytes -> a device slot, synchronously (used for drive reads)."""
         n = self.index.expert_bytes
         if not self.cuda:
             dst[:n].copy_(src[:n])

@@ -1,35 +1,8 @@
-"""Requests: labeled records from make_requests.py, selected for the partition in
-router.box_categories, and the chat formatting that turns a request into token ids.
+"""The chat formatting that turns a request (a record from make_requests.py) into token ids.
 
-    {"id": "code-0007", "category": "code", "source": "...", "request": "...", "reference": "..."}
+    {"id": "code-0007", "category": "code", "box": 0, "source": "...", "request": "...", "reference": "..."}
 """
 from __future__ import annotations
-
-import random
-
-
-def select(requests: list[dict], box_categories: list, n: int, box0_share: float = 0.5, seed: int = 0) -> list[dict]:
-    """n requests: round(n * box0_share) from box 0's categories and the rest from box 1's, spread
-    evenly over each side's categories, in a fixed random order. Categories no box serves are
-    left out. The same selection runs under every scheduling mode, so cells compare like for like."""
-    by_cat: dict[str, list[dict]] = {}
-    for r in requests:
-        by_cat.setdefault(r["category"], []).append(r)
-    picked, short = [], []
-    n0 = int(round(n * box0_share))
-    for box, (side, k) in enumerate(zip(box_categories, (n0, n - n0))):
-        if not side:
-            raise ValueError(f"router.box_categories gives box {box} no categories")
-        for i, c in enumerate(side):
-            m = k // len(side) + (i < k % len(side))
-            have = by_cat.get(c, [])
-            if m > len(have):
-                short.append(f"{c} needs {m}, the file has {len(have)}")
-            picked += have[:m]
-    if short:
-        raise ValueError("not enough requests: " + "; ".join(short))
-    random.Random(seed).shuffle(picked)
-    return picked
 
 
 class Formatter:

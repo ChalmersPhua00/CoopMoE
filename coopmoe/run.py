@@ -2,17 +2,18 @@
 
   1. store   check this box's expert store is there (built once on NFS by stage.py; bootstrap.sh
              copied it to this box's local disk)
-  2. start   this box's engine as a child process; box 1's engine is started on PGX-B by the
-             same Fuzzball job
+  2. start   this box's engine as a child process; box 1's engine is started on PGX-B by
+             the other Fuzzball job of the pair
   3. run     the requests through the scheduler once per cell: each request goes to a box (by
              category, or round-robin) and each box serves engine.max_sessions at a time
   4. report  <out>/report.md, <out>/<cell>.json, <out>/<cell>_outputs.jsonl; then both engines stop
 
-With emit, every result also goes to stdout as a '@@coopmoe <kind> <json>' line: that is how
-driver.py collects results from the Fuzzball job log.
+With emit, every result also goes to stdout as '@@coopmoe <kind> <i>/<n> <base64 chunk>' lines
+(_emit): that is how driver.py collects results from the Fuzzball job log.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import subprocess
@@ -29,7 +30,13 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _emit(kind: str, obj: dict) -> None:
-    print(f"{MARK} {kind} {json.dumps(obj, ensure_ascii=False, default=str)}", flush=True)
+    """One result as '@@coopmoe <kind> <i>/<n> <chunk>' lines: the JSON in base64, cut into
+    chunks. The Fuzzball CLI cannot read back a log line longer than 64 KB, and a cell's
+    result is longer than that."""
+    data = base64.b64encode(json.dumps(obj, ensure_ascii=False, default=str).encode()).decode()
+    chunks = [data[i:i + 8000] for i in range(0, len(data), 8000)] or [""]
+    for i, c in enumerate(chunks):
+        print(f"{MARK} {kind} {i + 1}/{len(chunks)} {c}", flush=True)
 
 
 def _start_engine(config: str, sets: list[str], log_path: str) -> subprocess.Popen:

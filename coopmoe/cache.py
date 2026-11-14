@@ -1,15 +1,13 @@
 """One box's expert cache: a single plain LRU over fixed-size slots, plus duplicate-first eviction.
 
 There are no hot / warm / cold tiers. What a box holds is whatever its own traffic (and the
-experts it runs for its peer) keeps recent. Two rules sit on top:
+experts it runs for its peer) keeps recent. One rule sits on top:
 
   duplicate-first eviction   when a slot is needed, an expert the peer also holds (per the
                              peer's last residency bitmap) goes before any expert only this
                              box holds. With dup_protect > 0, duplicates this box used within
                              its last dup_protect decode steps are spared (an ablation: it lost
                              to the plain rule on one emulation machine and won on another).
-  admission from the peer    lives in the engine (Admitter): a peer-held expert is fetched and
-                             admitted here only after this box sent it k times in W steps.
 
 Bookkeeping is per (layer, expert) key in numpy arrays, so picking a victim is one vectorized
 pass over 12,032 keys for Qwen3-235B. Experts are read-only, so a stale view of the peer

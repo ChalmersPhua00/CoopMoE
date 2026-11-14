@@ -24,7 +24,6 @@ class Counters:
             self.experts = Counter()     # "decode.local" -> routed experts (per layer call)
             self.pairs = Counter()       # "decode.local" -> token-expert pairs
             self.served = Counter()      # work done for the peer
-            self.admit = Counter()       # admissions fetched from the peer
             self.link = Counter()        # peer-link bytes from this box's side
             self.time = defaultdict(float)
             self.steps = 0               # decode steps
@@ -40,7 +39,7 @@ class Counters:
         with self.lock:
             out = {
                 "experts": dict(self.experts), "pairs": dict(self.pairs), "served": dict(self.served),
-                "admit": dict(self.admit), "link": dict(self.link), "time_s": dict(self.time),
+                "link": dict(self.link), "time_s": dict(self.time),
                 "steps": self.steps, "decode_tokens": self.decode_tokens,
                 "prefill_tokens": self.prefill_tokens, "turns": self.turns,
             }

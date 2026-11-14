@@ -11,9 +11,9 @@ with HF's routing):
     4. add the peer's partial sums; experts it reports MISS (stale bitmap) are read from
        own NVMe
 
-For the peer (serve_compute / serve_fetch): run requested experts that are in this box's
-cache, report the rest as MISS; hand out expert bytes for the peer's admissions. The peer
-never reads this box's drive on its behalf.
+For the peer (serve_compute): run requested experts that are in this box's cache, report the
+rest as MISS. The peer never reads this box's drive on its behalf, and expert weights never
+cross the link.
 """
 from __future__ import annotations
 
@@ -84,8 +84,6 @@ class MoeExecutor:
         fut = None
         if remote:
             fut = peer.compute_async(layer, remote, x)
-            if decode:
-                box.admitter.note([key for _, key, _, _ in remote], cache.step)
         c.add("experts", f"{phase}.{LOCAL}", len(hits))
         c.add("pairs", f"{phase}.{LOCAL}", sum(int(ti.numel()) for _, ti, _ in hits))
         t1 = time.perf_counter()
@@ -201,21 +199,3 @@ class MoeExecutor:
         c.add("served", "miss", len(miss))
         c.add("time", "served", svc)
         return {"miss": miss, "svc": svc}, [out]
-
-    def serve_fetch(self, h: dict) -> tuple[dict, list]:
-        box, cache = self.box, self.box.cache
-        have, blobs = [], []
-        n = self.index.expert_bytes
-        for key in h["keys"]:
-            slot, st = cache.acquire(int(key), reserve=False, local=False, refresh=False)
-            if st is Acquire.HIT:
-                try:
-                    blobs.append(cache.slab[slot][:n].cpu().clone())
-                finally:
-                    cache.release(int(key))
-                have.append(True)
-            else:
-                have.append(False)
-        box.counters.add("served", "fetch_hit", sum(have))
-        box.counters.add("served", "fetch_miss", len(have) - sum(have))
-        return {"have": have}, blobs

@@ -12,7 +12,7 @@ idles while it has requests waiting.
 
 Metrics per cell: aggregate output tok/s, time per output token (median, p95), TTFT, end-to-end
 latency on the box (dispatch to last token) and the wait before dispatch, where routed experts
-came from (own cache / peer / own NVMe), admissions fetched from the peer, cache overlap
+came from (own cache / peer / own NVMe), cache overlap
 |A n B| / |A u B| over time, turns per box, NVMe and link bytes. Every request keeps its
 generated text.
 """
@@ -98,7 +98,7 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
     lock = threading.Lock()
     queues: list[list] = [[], []]
     for r in requests:
-        queues[router.assign(r["category"])].append(r)
+        queues[router.assign(r)].append(r)
     records: list[dict] = []
     errors: list[str] = []
     progress = {"done": 0, "t_measure": None, "box_done": [None, None]}
@@ -204,12 +204,11 @@ def summarize(records, samples, stats, t_measure, t_end, t_start) -> dict:
     ttfts = [r["ttft_s"] for r in meas]
     e2e = [r["latency_s"] for r in meas]
     waits = [r["t_send"] for r in meas]  # everything arrives at the start
-    src, admit, link, served = Counter(), Counter(), Counter(), Counter()
+    src, link, served = Counter(), Counter(), Counter()
     nvme_bytes = 0
     for s in stats:
         c = s["counters"]
         src.update({k: v for k, v in c["experts"].items()})
-        admit.update(c["admit"])
         link.update(c["link"])
         served.update(c["served"])
         nvme_bytes += s["nvme_bytes"]
@@ -219,11 +218,13 @@ def summarize(records, samples, stats, t_measure, t_end, t_start) -> dict:
         return {k: src.get(f"{phase}.{k}", 0) / tot for k in SOURCES} if tot else {}
 
     msamples = [s for s in samples if s["measured"]] or samples
-    link_bytes = sum(v for k, v in link.items() if k in ("act_out", "partial_in", "fetch_in", "bitmap_out"))
+    link_bytes = sum(v for k, v in link.items() if k in ("act_out", "partial_in", "bitmap_out"))
     per_box = Counter(r["box"] for r in meas)
     return {
         "turns": len(meas), "wall_s": wall,
         "total_s": t_end - t_start, "out_tokens": out_tokens, "tok_s": out_tokens / wall,
+        # The whole run, warm-up included: first request sent -> last request finished.
+        "run_s": t_end - t_start, "run_tok_s": sum(r["out_tokens"] for r in records) / max(t_end - t_start, 1e-9),
         "tpot_ms_p50": None if not tpots else statistics.median(tpots) * 1e3,
         "tpot_ms_p95": None if not tpots else _pct(tpots, 0.95) * 1e3,
         "ttft_s_mean": None if not ttfts else statistics.mean(ttfts),
@@ -232,7 +233,6 @@ def summarize(records, samples, stats, t_measure, t_end, t_start) -> dict:
         "wait_s_mean": None if not waits else statistics.mean(waits),
         "decode_sources": share("decode"), "prefill_sources": share("prefill"),
         "peer_miss": src.get("decode.peer_miss", 0) + src.get("prefill.peer_miss", 0),
-        "admitted_from_peer": admit.get("admitted", 0),
         "overlap_jaccard_mean": statistics.mean(s["jaccard"] for s in msamples) if msamples else None,
         "overlap_final": samples[-1] if samples else None,
         "nvme_gb_s": nvme_bytes / wall / 1e9, "link_gb_s": link_bytes / wall / 1e9,

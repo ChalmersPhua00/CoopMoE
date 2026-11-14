@@ -62,14 +62,12 @@ class ModelConfig:
 
 @dataclass
 class CacheConfig:
-    """One plain LRU expert cache per box, plus two rules: duplicate-first eviction and admission."""
+    """One plain LRU expert cache per box, plus one rule: duplicate-first eviction."""
 
     gb: float = 1.0                  # expert-cache budget per box, GiB
     dup_first: bool = True           # evict experts the peer also holds before exclusive ones
     dup_protect_steps: int = 0       # >0: spare duplicates this box used in its last N decode steps
                                      # (0 = the plain rule: any duplicate goes first)
-    admit_k: int = 3                 # admit a peer-held expert once this box sent it k times...
-    admit_window: int = 64           # ...within this many decode steps. admit_k = 0: never admit
     remote_refresh: bool = True      # running an expert for the peer refreshes its LRU position
 
 
@@ -91,9 +89,7 @@ class EngineConfig:
 
 @dataclass
 class RouterConfig:
-    mode: str = "category"           # category | round_robin (baseline: alternate in arrival order)
-    # The fixed partition: the request categories box 0 serves, then those box 1 serves.
-    box_categories: list = field(default_factory=lambda: [["code"], ["general"]])
+    mode: str = "category"           # category: each request's box from make_requests.py | round_robin: alternate
 
 
 @dataclass
