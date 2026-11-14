@@ -119,10 +119,42 @@ class Box:
                                        max_batch_tokens=e.max_seq, max_requests_per_batch=e.max_batch,
                                        use_cuda_graph=False, use_async_batching=False, allow_block_sharing=False,
                                        auto_switch_to_flash=False)
+        # HF's KV footprint is ~1.5x the KV itself (masks, batch tensors); it must fit in 0.9 x free.
+        self._make_room(int((1.6 * e.max_sessions * self.kv_bytes_per_request() + 2**30) / 0.9))
         cb = self.model.init_continuous_batching(generation_config=gen, continuous_batching_config=cbc)
         cb.start()
+        t0 = time.time()
+        while cb.batch_processor is None:  # set by the loop thread once its KV cache exists
+            if not cb.is_running():
+                raise RuntimeError("HF's generation loop failed to start (its error is logged above)")
+            if time.time() - t0 > 600:
+                raise RuntimeError("HF's generation loop did not start within 600 s")
+            time.sleep(0.05)
         self.cb_cfg = cfg
         return cb
+
+    def _make_room(self, nbytes: int) -> None:
+        """On the GB10 (unified memory) cudaMemGetInfo's "free" leaves out the page cache, although
+        an allocation reclaims it. HF sizes and checks its KV cache against that "free", so on a
+        node whose page cache is full (the store copy alone adds ~32-226 GB) it refuses to start.
+        Allocating and touching nbytes once makes the kernel reclaim that much; freeing it leaves it
+        free for HF's check."""
+        if self.device.type != "cuda":
+            return
+        free, _ = torch.cuda.mem_get_info(self.device)
+        if free >= nbytes:
+            return
+        try:
+            x = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
+            x.fill_(0)
+            torch.cuda.synchronize(self.device)
+            del x
+        except torch.OutOfMemoryError:
+            self.log(f"[box{self.rank}] could not reclaim {nbytes / 2**30:.1f} GiB for the KV cache")
+        torch.cuda.empty_cache()
+        after, _ = torch.cuda.mem_get_info(self.device)
+        self.log(f"[box{self.rank}] free memory {free / 2**30:.1f} -> {after / 2**30:.1f} GiB "
+                 f"(reclaimed page cache for the KV cache, wanted {nbytes / 2**30:.1f} GiB)")
 
     @staticmethod
     def _cb_key(cfg: RunConfig) -> tuple:
