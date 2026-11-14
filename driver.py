@@ -230,7 +230,7 @@ def submit(wf: str, path: str, job: str) -> tuple[str, str]:
 
 
 def run_pair(wfs: list[str], paths: list[str], until_box0: bool) -> tuple[list[str], list]:
-    """Starts one workflow per box, both at once, and follows both job logs. until_box0: the
+    """Starts one workflow per box (box 1's once box 0's job is running) and follows both job logs. until_box0: the
     run is over when box 0's workflow ends (box 1 only serves, and is stopped if it is still
     there a minute later); otherwise it waits for both. Ctrl-C or a failed start stops whatever
     was started. -> (workflow ids, final statuses)."""
@@ -241,8 +241,16 @@ def run_pair(wfs: list[str], paths: list[str], until_box0: bool) -> tuple[list[s
         finals[b] = follow(wids[b], "run", prefix=f"[box{b}] ")
 
     try:
-        for wf, path in zip(wfs, paths):
-            wids.append(start(wf, path))
+        wids.append(start(wfs[0], paths[0]))
+        # Box 1's workflow only once box 0's job is running: submitted together, Fuzzball tends
+        # to put both jobs' scratch volumes on the same node.
+        t0 = time.time()
+        while not re.search(r"^Job\s*\|\s*(Started|Finished|Failed|Errored)",
+                            fuzzball("workflow", "describe", wids[0], check=False), re.MULTILINE):
+            if time.time() - t0 > 300:
+                break
+            time.sleep(5)
+        wids.append(start(wfs[1], paths[1]))
         threads = [threading.Thread(target=watch, args=(b,), daemon=True) for b in (0, 1)]
         for t in threads:
             t.start()
