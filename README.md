@@ -36,6 +36,7 @@ pip install datasets
 python make_requests.py --out data/requests.json  # once: labeled requests
 python stage.py --model qwen3-235b-a22b --size 500GiB  # once per model
 python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 8
+python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 8 --baseline
 ```
 
 **[stage.py](stage.py)** `--model` (`qwen3-235b-a22b` or `qwen3-30b-a3b`) `--size` (both required)
@@ -62,6 +63,14 @@ python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b 
      came from (own cache / other box / disk), cache overlap
    - `<setup>_outputs.jsonl`: one line per request, with its timings and generated text
    - `<setup>.json`, `overlap.csv`, `requests.json`, `coopmoe.fz`, `job.log`
+
+**Baseline** (`driver.py ... --baseline`): the same requests, split the same way, with the same
+model, cache and `--concurrency`, but as two single-node jobs that never talk to each other
+([fuzzball/solo.fz](fuzzball/solo.fz), `link.enabled=false`): every miss is read from the box's
+own NVMe. Both jobs start at once. `results/<model>-<time>-baseline/` has each box's row and the
+merged `indep_cat` row: all generated tokens over the slower box's measured time, as in a linked
+run, so `tok/s` of the linked run over `indep_cat` is the speedup the link buys. Each box warms up
+on half of `bench.warmup_sessions`, its share of a linked run's warm-up.
 
 Everything else is fixed in `SETTINGS` at the top of `driver.py` (provisioner `team1`, mounts,
 image, 1 GPU / 20 cores / 120 GiB per node, timeouts), and `stage.py` uses the same values.
@@ -121,7 +130,8 @@ without regenerating the file.
 stage.py            once per model: its NFS volume + the expert store on it
 make_requests.py    once: labeled requests from public datasets -> data/requests.json
 driver.py           one experiment: requests + volume -> Fuzzball job on both boxes -> results/
-fuzzball/           stage.fz, coopmoe.fz (job templates), bootstrap.sh (what each node runs),
+fuzzball/           stage.fz, coopmoe.fz, solo.fz (job templates: stage, linked run, one baseline
+                    box), bootstrap.sh (what each node runs),
                     tests/smoke.fz (temporary cluster check)
 coopmoe/            the engine, run inside the jobs as python -m coopmoe stage | engine | run
   run.py            the experiment on PGX-A: engine, requests through the scheduler, report

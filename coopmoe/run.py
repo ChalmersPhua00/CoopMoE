@@ -8,6 +8,10 @@
              category, or round-robin) and each box serves engine.max_sessions at a time
   4. report  <out>/report.md, <out>/<cell>.json, <out>/<cell>_outputs.jsonl; then both engines stop
 
+With solo=B (the baseline: two single-node jobs, no link between the boxes), this job is box B
+alone: it starts only box B's engine, with link.enabled=false, and runs only box B's requests.
+driver.py --baseline submits one such job per box and merges their results.
+
 With emit, every result also goes to stdout as a '@@coopmoe <kind> <json>' line: that is how
 driver.py collects results from the Fuzzball job log.
 """
@@ -32,22 +36,22 @@ def _emit(kind: str, obj: dict) -> None:
     print(f"{MARK} {kind} {json.dumps(obj, ensure_ascii=False, default=str)}", flush=True)
 
 
-def _start_engine(config: str, sets: list[str], log_path: str) -> subprocess.Popen:
+def _start_engine(config: str, rank: int, sets: list[str], log_path: str) -> subprocess.Popen:
     with open(log_path, "w") as f:
-        return subprocess.Popen([sys.executable, "-m", "coopmoe", "engine", "--config", config, "--rank", "0",
+        return subprocess.Popen([sys.executable, "-m", "coopmoe", "engine", "--config", config, "--rank", str(rank),
                                  "--set", *sets], cwd=REPO, stdout=f, stderr=subprocess.STDOUT)
 
 
 def _wait_ready(pool: BoxPool, engine: subprocess.Popen, path: str, timeout: float, log) -> None:
     t0, said = time.time(), False
-    for b in (0, 1):
+    for b in pool.active:
         while True:
             try:
                 pool.call(b, {"op": "ping"})
                 break
             except Exception:
                 if engine.poll() is not None:
-                    raise SystemExit(f"engine0 exited with {engine.returncode}; see {path}")
+                    raise SystemExit(f"the local engine exited with {engine.returncode}; see {path}")
                 if time.time() - t0 > timeout:
                     raise SystemExit(f"box {b} did not answer within {timeout:.0f} s")
                 if b == 1 and not said and time.time() - t0 > 60:
@@ -57,26 +61,36 @@ def _wait_ready(pool: BoxPool, engine: subprocess.Popen, path: str, timeout: flo
 
 
 def run(config: str, model: str, store: str, requests: list[dict], cells: list, out: str, boxes: list[str],
-        emit: bool = False, ready_timeout: float = 12 * 3600, log=print) -> list[dict]:
+        emit: bool = False, ready_timeout: float = 12 * 3600, log=print, solo: int | None = None) -> list[dict]:
     if not os.path.exists(os.path.join(store, "index.json")):
         raise SystemExit(f"no expert store at {store}: build it once with stage.py")
+    if solo is not None and solo not in (0, 1):
+        raise SystemExit(f"--solo must be 0 or 1, got {solo}")
+    rank = 0 if solo is None else solo
+    active = (0, 1) if solo is None else (solo,)
+    if solo is not None:  # one box on its own: the other box's address is never dialled
+        boxes = [boxes[0], boxes[0]]
     sets = [f"store_dir={store}", f"cluster.addrs={json.dumps(boxes)}"]
+    if solo is not None:
+        sets.append("link.enabled=false")
     cfg = load_run_config(config, sets)
+    if solo is not None and cfg.router.mode != "category":
+        raise SystemExit("a single-box job needs router.mode=category (round_robin sends requests to both boxes)")
     os.makedirs(out, exist_ok=True)
     by_id = {r["id"]: r for r in requests}
 
-    pool = BoxPool(boxes, timeout=cfg.cluster.connect_timeout)
-    path = os.path.join(out, "engine0.log")
-    engine = _start_engine(config, sets, path)
+    pool = BoxPool(boxes, timeout=cfg.cluster.connect_timeout, active=active)
+    path = os.path.join(out, f"engine{rank}.log")
+    engine = _start_engine(config, rank, sets, path)
     results = []
     try:
-        log(f"waiting for both engines ({', '.join(boxes)}; engine0 log in {path})")
+        log(f"waiting for engine(s) {', '.join(f'{b} at {boxes[b]}' for b in active)} (local engine log in {path})")
         _wait_ready(pool, engine, path, ready_timeout, log)
-        infos = [pool.call(b, {"op": "ping"})[0]["info"] for b in (0, 1)]
+        infos = [pool.call(b, {"op": "ping"})[0]["info"] for b in active]
         for info in infos:
             log(f"box {info['rank']} on {info['host']}: {info['device']}, {info['slots']} expert slots "
-                f"({info['cache_gib']:.1f} GiB), store {info['store_dtype']}")
-        if infos[0]["n_keys"] != infos[1]["n_keys"]:
+                f"({info['cache_gib']:.1f} GiB), store {info['store_dtype']}, link {info['link']}")
+        if len({i["n_keys"] for i in infos}) != 1:
             raise SystemExit("the two boxes loaded different models")
         fmt = Formatter.for_store(store)
         for epoch, (tag, cell_overrides) in enumerate(cells, start=1):
@@ -99,7 +113,7 @@ def run(config: str, model: str, store: str, requests: list[dict], cells: list, 
             _emit("done", {"out": out})
         return results
     finally:
-        for b in (0, 1):
+        for b in active:
             try:
                 pool.call(b, {"op": "shutdown"})
             except Exception:
@@ -125,6 +139,8 @@ def main(argv=None) -> None:
     ap.add_argument("--cell", action="append", required=True, metavar="'TAG KEY=VALUE ...'",
                     help="one cell: a tag, then config overrides; repeatable")
     ap.add_argument("--emit", action="store_true", help="results to stdout as '@@coopmoe' lines")
+    ap.add_argument("--solo", type=int, choices=(0, 1),
+                    help="baseline: this job is only this box, with the link off (--boxes: its own address)")
     args = ap.parse_args(argv)
 
     def log(msg: str) -> None:
@@ -133,4 +149,5 @@ def main(argv=None) -> None:
     with open(args.requests, encoding="utf-8") as f:
         requests = json.load(f)
     cells = [(c.split()[0], c.split()[1:]) for c in args.cell]
-    run(args.config, args.model, args.store, requests, cells, args.out, args.boxes.split(","), args.emit, log=log)
+    run(args.config, args.model, args.store, requests, cells, args.out, args.boxes.split(","), args.emit, log=log,
+        solo=args.solo)

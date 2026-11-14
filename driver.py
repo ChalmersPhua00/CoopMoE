@@ -22,6 +22,12 @@ Each volume holds one model's expert store, so its name says which model to run.
               report.md (throughput, TTFT, TPOT, latency, where experts came from), <setup>.json,
               <setup>_outputs.jsonl (one line per request), requests.json, coopmoe.fz, job.log
 
+Baseline (--baseline): the same requests, model, cache and concurrency, but as two single-node
+jobs that never talk to each other (fuzzball/solo.fz, link.enabled=false): each box serves its
+own categories and reads every miss from its own NVMe. Both jobs start at once; their results
+are merged into one setup, indep_cat, next to each box's own row, in results/<model>-<time>-baseline/.
+Throughput is all generated tokens over the slower box's measured time, as in a linked run.
+
 Everything else is fixed in SETTINGS below. To change the engines or the scheduler (cache.gb,
 link, router mode), edit the model's run config. experiment() is the same thing as a function,
 for scripts that compare several setups.
@@ -32,12 +38,14 @@ import argparse
 import base64
 import io
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 import sys
 import tarfile
+import threading
 import time
 from collections import Counter
 
@@ -45,7 +53,8 @@ REPO = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, REPO)
 
 from coopmoe.config import load_run_config  # noqa: E402
-from coopmoe.report import render, write_cell  # noqa: E402
+from coopmoe.report import render, summarize, write_cell  # noqa: E402
+from coopmoe.router import box_of_category  # noqa: E402
 from coopmoe.workload import select  # noqa: E402
 
 # The two models the configs are written for: short name -> (Hub repo, run config).
@@ -155,6 +164,18 @@ def render_workflow(short: str, picked: list[dict], cells: list) -> str:
                                **job_values(short, S.timeout)})
 
 
+def render_solo(short: str, picked: list[dict], box: int, cell: tuple) -> str:
+    """fuzzball/solo.fz: box `box` alone (the baseline), serving `picked` (its own requests)."""
+    q = shlex.quote
+    local = "127.0.0.1:" + S.boxes[box].rsplit(":", 1)[1]  # the engine and the scheduler share the node
+    run_args = ["--solo", str(box), "--cell", " ".join([cell[0], *cell[1]])]
+    boot = bootstrap(short, "", q(f"{local},{local}"), " ".join(q(a) for a in run_args))
+    requests = "[\n" + ",\n".join(json.dumps(r) for r in picked) + "\n]"
+    with open(os.path.join(REPO, "fuzzball", "solo.fz")) as f:
+        return fill(f.read(), {"BOOTSTRAP": block(boot), "REQUESTS": block(requests), "GPUS": str(S.gpus),
+                               **job_values(short, S.timeout)})
+
+
 # ---------------------------------------------------------------------- fuzzball
 def fuzzball(*cli: str, check: bool = True) -> str:
     p = subprocess.run([S.fuzzball, *cli], capture_output=True, text=True)
@@ -168,13 +189,13 @@ def status(wid: str) -> str:
     return m.group(1) if m else "?"
 
 
-def follow(wid: str, job: str) -> str:
+def follow(wid: str, job: str, prefix: str = "") -> str:
     """Streams the job's log until the workflow ends. -> its final status."""
     last = None
     while True:
         st = status(wid)
         if st != last:
-            log(f"workflow {wid}: {st}")
+            log(f"{prefix}workflow {wid}: {st}")
             last = st
         if st in DONE:
             return st
@@ -183,13 +204,13 @@ def follow(wid: str, job: str) -> str:
                                  stderr=subprocess.STDOUT, text=True)
             for line in p.stdout:
                 if MARK not in line:
-                    print(line, end="", flush=True)
+                    print(prefix + line, end="", flush=True)
             p.wait()
         time.sleep(S.poll)
 
 
-def submit(wf: str, path: str, job: str) -> tuple[str, str]:
-    """Writes, validates, starts and follows a workflow. -> (workflow id, final status)."""
+def start(wf: str, path: str) -> str:
+    """Writes, validates and starts a workflow. -> its id."""
     with open(path, "w") as f:
         f.write(wf)
     log(f"workflow: {path} ({len(wf) / 1e3:.0f} kB)")
@@ -198,8 +219,13 @@ def submit(wf: str, path: str, job: str) -> tuple[str, str]:
     m = UUID.search(started)
     if not m:
         raise SystemExit(f"no workflow id in: {started}")
-    wid = m.group(0)
-    log(f"started workflow {wid}; Ctrl-C stops it")
+    log(f"started workflow {m.group(0)}; Ctrl-C stops it")
+    return m.group(0)
+
+
+def submit(wf: str, path: str, job: str) -> tuple[str, str]:
+    """Writes, validates, starts and follows a workflow. -> (workflow id, final status)."""
+    wid = start(wf, path)
     try:
         return wid, follow(wid, job)
     except KeyboardInterrupt:
@@ -225,12 +251,9 @@ def collect(job_log: str) -> tuple[list[dict], dict[str, list[dict]]]:
 
 
 # ---------------------------------------------------------------------- the experiment
-def experiment(volume: str, requests: str, num: int = 64, concurrency: int | None = None,
-               cells: list | None = None) -> tuple[str, list[dict]]:
-    """One Fuzzball job: num requests per box from the requests file, run on the model in volume,
-    each box serving `concurrency` of them at a time, batched (default: the run config's
-    engine.max_sessions). cells: [(tag, [KEY=VALUE, ...]), ...] setups to run one after another in
-    that job; default is the run config as it is. -> (results directory, results per setup)."""
+def plan(volume: str, requests: str, num: int, concurrency: int | None):
+    """What a linked run and its baseline share: the model, its run config, the same selected
+    requests and the per-box concurrency. -> (short name, run config, picked requests, concurrency)."""
     short = volume_model(volume)
     repo, config = MODELS[short]
     cfg = load_run_config(os.path.join(REPO, config), [])
@@ -245,6 +268,17 @@ def experiment(volume: str, requests: str, num: int = 64, concurrency: int | Non
     if conc < 1:
         raise SystemExit(f"concurrency must be at least 1, got {conc}")
     log(f"each box serves {conc} requests at a time")
+    return short, cfg, picked, conc
+
+
+def experiment(volume: str, requests: str, num: int = 64, concurrency: int | None = None,
+               cells: list | None = None) -> tuple[str, list[dict]]:
+    """One Fuzzball job: num requests per box from the requests file, run on the model in volume,
+    each box serving `concurrency` of them at a time, batched (default: the run config's
+    engine.max_sessions). cells: [(tag, [KEY=VALUE, ...]), ...] setups to run one after another in
+    that job; default is the run config as it is. -> (results directory, results per setup)."""
+    short, cfg, picked, conc = plan(volume, requests, num, concurrency)
+    repo = MODELS[short][0]
     if cells is None:
         mode, link = cfg.router.mode, cfg.link.enabled
         cells = [(f"{'linked' if link else 'indep'}_{'cat' if mode == 'category' else 'rr'}", [])]
@@ -272,6 +306,103 @@ def experiment(volume: str, requests: str, num: int = 64, concurrency: int | Non
     return out, results
 
 
+def merge_boxes(tag: str, parts: list[dict], outputs: list[dict]) -> dict:
+    """Two single-box results (box 0's, box 1's) -> one result for the pair, computed like a
+    linked run's: every measured request, both boxes' expert sources and drive bytes, and the
+    slower box's measured time as the wall time (as if both had started together)."""
+    records = [{"box": o["box"], "measured": o["measured"], "out_tokens": o["output_tokens"],
+                "tpot_s": None if o["tpot_ms"] is None else o["tpot_ms"] / 1e3, "ttft_s": o["ttft_s"],
+                "latency_s": o["e2e_s"], "t_send": o["wait_s"]} for o in outputs]
+    wall = max(p["summary"]["wall_s"] for p in parts)
+    summary = summarize(records, [], [s for p in parts for s in p["box_stats"]], 0.0, wall, 0.0)
+    summary["total_s"] = max(p["summary"]["total_s"] for p in parts)
+    summary["box_done_s"] = [parts[b]["summary"]["box_done_s"][b] for b in (0, 1)]
+    summary["errors"] = sum(p["summary"].get("errors", 0) for p in parts)
+    return {"tag": tag, "workload": parts[0]["workload"], "model": parts[0]["model"],
+            "overrides": parts[0]["overrides"], "boxes": [i for p in parts for i in p["boxes"]],
+            "summary": summary, "router": {f"box{b}": p["router"] for b, p in enumerate(parts)},
+            "box_stats": [s for p in parts for s in p["box_stats"]], "overlap": [],
+            "errors": [e for p in parts for e in p.get("errors", [])]}
+
+
+def baseline(volume: str, requests: str, num: int = 64, concurrency: int | None = None) -> tuple[str, list[dict]]:
+    """The baseline for experiment(): the same requests, split the same way, served by two
+    single-node jobs started together, each with the link off. -> (results directory,
+    [box 0's result, box 1's result, the merged result])."""
+    short, cfg, picked, conc = plan(volume, requests, num, concurrency)
+    repo = MODELS[short][0]
+    if cfg.router.mode != "category":
+        raise SystemExit("the baseline splits requests by category: set router.mode=category in the run config")
+    box_of = box_of_category(cfg.router.box_categories)
+    # A linked run warms up on its first warmup_sessions requests across both boxes; each box
+    # here warms up on its share of that.
+    warm = math.ceil(cfg.bench.warmup_sessions / 2)
+    overrides = [f"engine.max_sessions={conc}", f"engine.max_batch={conc}", "link.enabled=false",
+                 f"bench.warmup_sessions={warm}"]
+    log(f"baseline: two single-node jobs, link off, {warm} warm-up requests per box")
+
+    out = os.path.join(REPO, "results", f"{short}-{time.strftime('%Y%m%d-%H%M%S')}-baseline")
+    os.makedirs(out, exist_ok=True)
+    with open(os.path.join(out, "requests.json"), "w", encoding="utf-8") as f:
+        json.dump(picked, f, ensure_ascii=False, indent=1)
+    wids = []
+    try:
+        for b in (0, 1):
+            mine = [r for r in picked if box_of[r["category"]] == b]
+            d = os.path.join(out, f"box{b}")
+            os.makedirs(d, exist_ok=True)
+            wf = render_solo(short, mine, b, (f"indep_cat_box{b}", overrides))
+            wids.append(start(wf, os.path.join(d, "solo.fz")))
+        finals = [None, None]
+
+        def watch(b: int) -> None:
+            finals[b] = follow(wids[b], "run", prefix=f"[box{b}] ")
+
+        threads = [threading.Thread(target=watch, args=(b,), daemon=True) for b in (0, 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            while t.is_alive():
+                t.join(timeout=1.0)
+    except KeyboardInterrupt:
+        for wid in wids:
+            log(f"stopping workflow {wid}")
+            fuzzball("workflow", "stop", wid, check=False)
+        raise
+
+    parts, outs = [], []
+    for b in (0, 1):
+        d = os.path.join(out, f"box{b}")
+        job_log = fuzzball("workflow", "log", wids[b], "run", check=False)
+        with open(os.path.join(d, "job.log"), "w") as f:
+            f.write(job_log)
+        results, outputs = collect(job_log)
+        if finals[b] != "STAGE_STATUS_FINISHED" or not results:
+            log(f"box {b}: workflow ended {finals[b]} with {len(results)} of 1 setups; see {d}/job.log")
+            continue
+        res = results[0]
+        res["workload"] = f"{len(picked)} requests"  # one table for both boxes and the pair
+        o = outputs.get(res["tag"], [])
+        write_cell(d, res, o)
+        res["turns"] = o
+        parts.append(res)
+        outs += o
+    title = f"# {repo} (baseline: two single-node jobs, no link)\n\n"
+    if len(parts) < 2:
+        log(f"no merged baseline: {len(parts)} of 2 boxes finished; see {out}")
+        if parts:
+            with open(os.path.join(out, "report.md"), "w") as f:
+                f.write(title + render(parts))
+        return out, parts
+    merged = merge_boxes("indep_cat", parts, [dict(o, cell="indep_cat") for o in outs])
+    write_cell(out, merged, [dict(o, cell="indep_cat") for o in outs])
+    merged["turns"] = outs
+    results = parts + [merged]
+    with open(os.path.join(out, "report.md"), "w") as f:
+        f.write(title + render(results))
+    return out, results
+
+
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--requests", required=True, help="labeled requests JSON (make_requests.py)")
@@ -280,9 +411,12 @@ def main(argv=None) -> None:
     ap.add_argument("--num", type=int, default=64, help="requests per box (default 64)")
     ap.add_argument("--concurrency", type=int,
                     help="requests each box serves at a time, batched (default: the run config's, 4)")
+    ap.add_argument("--baseline", action="store_true",
+                    help="two single-node jobs with the link off instead of one linked two-node job")
     args = ap.parse_args(argv)
 
-    out, results = experiment(args.volume, args.requests, args.num, args.concurrency)
+    run_fn = baseline if args.baseline else experiment
+    out, results = run_fn(args.volume, args.requests, args.num, args.concurrency)
     if not results:
         return
     with open(os.path.join(out, "report.md")) as f:

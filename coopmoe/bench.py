@@ -18,27 +18,27 @@ generated text.
 """
 from __future__ import annotations
 
-import statistics
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
 
 import numpy as np
 
 from coopmoe.config import RunConfig
+from coopmoe.report import summarize
 from coopmoe.router import Router
-from coopmoe.stats import SOURCES
 from coopmoe.transport import TcpClient
 from coopmoe.workload import Formatter
 
 
 class BoxPool:
-    """Thread-safe access to both boxes: one connection per calling thread and box."""
+    """Thread-safe access to the boxes: one connection per calling thread and box.
 
-    def __init__(self, addrs: list, timeout: float = 600.0):
-        self.addrs, self.timeout = addrs, timeout
+    active: the boxes that are present. Both normally; one in a single-node baseline job, where
+    the other box runs as its own job and every "both" call goes to this box only."""
+
+    def __init__(self, addrs: list, timeout: float = 600.0, active: tuple = (0, 1)):
+        self.addrs, self.timeout, self.active = addrs, timeout, tuple(active)
         self._tls = threading.local()
         self._all: list = []
         self._lock = threading.Lock()
@@ -59,7 +59,8 @@ class BoxPool:
         return self._client(box).call(header, tensors)
 
     def both(self, header: dict) -> list:
-        futs = [self._ex.submit(self.call, b, header) for b in (0, 1)]
+        """The same call on every active box, in parallel. -> replies in box order."""
+        futs = [self._ex.submit(self.call, b, header) for b in self.active]
         return [f.result() for f in futs]
 
     def release_thread(self) -> None:
@@ -78,11 +79,6 @@ class BoxPool:
             c.close()
 
 
-def _pct(xs: list[float], q: float) -> Optional[float]:
-    xs = sorted(xs)
-    return xs[min(len(xs) - 1, int(q * len(xs)))] if xs else None
-
-
 def _overlap(a: np.ndarray, b: np.ndarray) -> dict:
     inter, union = int((a & b).sum()), int((a | b).sum())
     return {"a": int(a.sum()), "b": int(b.sum()), "inter": inter, "union": union,
@@ -99,6 +95,11 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
     queues: list[list] = [[], []]
     for r in requests:
         queues[router.assign(r["category"])].append(r)
+    for box in (0, 1):
+        if queues[box] and box not in pool.active:
+            raise ValueError(f"{len(queues[box])} requests go to box {box}, which is not in this job "
+                             f"(active boxes: {list(pool.active)})")
+    paired = len(pool.active) == 2  # cache overlap needs both caches
     records: list[dict] = []
     errors: list[str] = []
     progress = {"done": 0, "t_measure": None, "box_done": [None, None]}
@@ -177,68 +178,25 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
     if progress["t_measure"] is not None:
         pool.both({"op": "reset_counters"})
     smp = threading.Thread(target=sampler, daemon=True)
-    smp.start()
+    if paired:
+        smp.start()
     workers = [threading.Thread(target=worker, args=(box,), name=f"box{box}-slot{k}")
-               for box in (0, 1) for k in range(cfg.engine.max_sessions)]
+               for box in pool.active for k in range(cfg.engine.max_sessions)]
     for w in workers:
         w.start()
     for w in workers:
         w.join()
     t_end = time.perf_counter()
     stop.set()
-    smp.join()
-    sample()
+    if paired:
+        smp.join()
+        sample()
     stats = [rh["stats"] for rh, _ in pool.both({"op": "stats"})]
     summary = summarize(records, samples, stats, progress["t_measure"] or t_start, t_end, t_start)
     summary["box_done_s"] = progress["box_done"]
     summary["errors"] = len(errors)
     return {"boxes": infos, "summary": summary, "router": router.summary(), "box_stats": stats,
             "overlap": samples, "turns": records, "errors": errors}
-
-
-def summarize(records, samples, stats, t_measure, t_end, t_start) -> dict:
-    meas = [r for r in records if r["measured"]] or records
-    wall = max(t_end - t_measure, 1e-9)
-    out_tokens = sum(r["out_tokens"] for r in meas)
-    tpots = [r["tpot_s"] for r in meas if r["tpot_s"] is not None]
-    ttfts = [r["ttft_s"] for r in meas]
-    e2e = [r["latency_s"] for r in meas]
-    waits = [r["t_send"] for r in meas]  # everything arrives at the start
-    src, admit, link, served = Counter(), Counter(), Counter(), Counter()
-    nvme_bytes = 0
-    for s in stats:
-        c = s["counters"]
-        src.update({k: v for k, v in c["experts"].items()})
-        admit.update(c["admit"])
-        link.update(c["link"])
-        served.update(c["served"])
-        nvme_bytes += s["nvme_bytes"]
-
-    def share(phase: str) -> dict:
-        tot = sum(src.get(f"{phase}.{k}", 0) for k in SOURCES)
-        return {k: src.get(f"{phase}.{k}", 0) / tot for k in SOURCES} if tot else {}
-
-    msamples = [s for s in samples if s["measured"]] or samples
-    link_bytes = sum(v for k, v in link.items() if k in ("act_out", "partial_in", "fetch_in", "bitmap_out"))
-    per_box = Counter(r["box"] for r in meas)
-    return {
-        "turns": len(meas), "wall_s": wall,
-        "total_s": t_end - t_start, "out_tokens": out_tokens, "tok_s": out_tokens / wall,
-        "tpot_ms_p50": None if not tpots else statistics.median(tpots) * 1e3,
-        "tpot_ms_p95": None if not tpots else _pct(tpots, 0.95) * 1e3,
-        "ttft_s_mean": None if not ttfts else statistics.mean(ttfts),
-        "ttft_s_p95": _pct(ttfts, 0.95),
-        "e2e_s_p50": None if not e2e else statistics.median(e2e), "e2e_s_p95": _pct(e2e, 0.95),
-        "wait_s_mean": None if not waits else statistics.mean(waits),
-        "decode_sources": share("decode"), "prefill_sources": share("prefill"),
-        "peer_miss": src.get("decode.peer_miss", 0) + src.get("prefill.peer_miss", 0),
-        "admitted_from_peer": admit.get("admitted", 0),
-        "overlap_jaccard_mean": statistics.mean(s["jaccard"] for s in msamples) if msamples else None,
-        "overlap_final": samples[-1] if samples else None,
-        "nvme_gb_s": nvme_bytes / wall / 1e9, "link_gb_s": link_bytes / wall / 1e9,
-        "turns_per_box": [per_box.get(0, 0), per_box.get(1, 0)],
-        "busy_skips": link.get("busy_skips", 0),
-    }
 
 
 def format_row(tag: str, s: dict) -> str:
