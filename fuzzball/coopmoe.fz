@@ -1,0 +1,61 @@
+# ONE box of a CoopMoE experiment on the team's two PGX boxes (DGX Spark, GB10), as a
+# single-node Fuzzball workflow (v4 syntax). driver.py fills in every double-brace placeholder
+# and starts it twice, once per box, at the same time:
+#   run     box 0 (PGX-A): starts box 0's engine, runs the requests through the scheduler,
+#           prints the results into this job's log
+#   engine  box 1 (PGX-B): serves as box 1 until box 0 stops it
+# Two jobs instead of one two-node job because Fuzzball refuses a multinode job that mounts a
+# node-local volume (the box's NVMe). run and engine find each other through the NFS volume and
+# talk over the CX-7 link (fuzzball/bootstrap.sh, rendezvous).
+# The code and the requests travel inside the workflow (code.tgz.b64), so the job needs no git access.
+#
+#   data     the model's persistent volume: NFS (10.10.11.1:/hackathon/team-01), the SAME files
+#            on both boxes. Holds the one expert store (built once by fuzzball/stage.fz), the
+#            rendezvous files and the results.
+#   scratch  this node's own NVMe (a hostpath volume: /dev/nvme0n1p2 on the node), wiped when
+#            the job ends. The box copies the store here at job start and reads its expert
+#            misses from it.
+version: v4
+
+files:
+  bootstrap.sh: |
+{{BOOTSTRAP}}
+  code.tgz.b64: |
+{{CODE}}
+
+volumes:
+  data:
+    use: {{VOLUME_USE}}
+    name: {{VOLUME}}
+  scratch:
+    use: {{SCRATCH}}
+
+jobs:
+  run:
+    image:
+      uri: {{IMAGE}}
+    script: |
+      #!/bin/bash
+      bash /opt/coopmoe/bootstrap.sh {{ROLE}}
+    env:
+      - HF_HOME={{DATA}}/hf-cache
+    files:
+      /opt/coopmoe/bootstrap.sh: file://bootstrap.sh
+      /opt/coopmoe/code.tgz.b64: file://code.tgz.b64
+    mounts:
+      {{DATA}}: data
+      {{LOCAL}}: scratch
+    resource:
+      cpu:
+        cores: {{CORES}}
+      # GB10 memory is unified: the expert cache, weights and KV come out of this same pool.
+      # This is a hard limit (the process is killed above it), so it asks for nearly the whole
+      # node; cache.gb in the run config sizes the cache (U4).
+      memory:
+        size: {{MEMORY}}
+      devices:
+        nvidia.com/gpu: {{GPUS}}
+      exclusive: true
+    policy:
+      timeout:
+        execute: {{TIMEOUT}}
