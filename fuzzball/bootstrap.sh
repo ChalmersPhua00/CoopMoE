@@ -48,6 +48,9 @@ copy_store() {
   local t0 t bytes
   t0=$(date +%s)
   rm -rf "$STORE.partial" && mkdir -p "$STORE.partial"
+  # Directories first: parallel cp --parents processes race to create the same parent and lose
+  # with "File exists".
+  (cd "$NFS_STORE" && find . -type d -print0 | (cd "$STORE.partial" && xargs -0 mkdir -p))
   (cd "$NFS_STORE" && find . -type f -print0 | xargs -0 -P 8 -I@ cp --parents @ "$STORE.partial/")
   mv "$STORE.partial" "$STORE"
   t=$(( $(date +%s) - t0 )); bytes=$(du -sb "$STORE" | cut -f1)
