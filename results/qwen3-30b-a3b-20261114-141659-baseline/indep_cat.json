@@ -1,0 +1,257 @@
+{
+ "tag": "indep_cat",
+ "workload": "64 requests",
+ "model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+ "overrides": [
+  "engine.max_sessions=4",
+  "engine.max_batch=4",
+  "link.enabled=false",
+  "bench.warmup_sessions=4"
+ ],
+ "boxes": [
+  {
+   "rank": 0,
+   "host": "run",
+   "device": "cuda",
+   "store_dtype": "float8_e4m3fn",
+   "compute_dtype": "bfloat16",
+   "slots": 2728,
+   "slot_mib": 4.50390625,
+   "cache_gib": 11.998687744140625,
+   "n_keys": 6144,
+   "kv_session_gib": 0.75,
+   "nvme_ms_per_expert": 1.2101907692307692,
+   "link": false
+  },
+  {
+   "rank": 1,
+   "host": "run",
+   "device": "cuda",
+   "store_dtype": "float8_e4m3fn",
+   "compute_dtype": "bfloat16",
+   "slots": 2728,
+   "slot_mib": 4.50390625,
+   "cache_gib": 11.998687744140625,
+   "n_keys": 6144,
+   "kv_session_gib": 0.75,
+   "nvme_ms_per_expert": 1.2101907692307692,
+   "link": false
+  }
+ ],
+ "summary": {
+  "turns": 50,
+  "wall_s": 1206.4914660040013,
+  "total_s": 1343.7003511479998,
+  "out_tokens": 6400,
+  "tok_s": 5.304637604439363,
+  "tpot_ms_p50": 735.2299999999999,
+  "tpot_ms_p95": 1759.65,
+  "ttft_s_mean": 5.611234,
+  "ttft_s_p95": 14.5579,
+  "e2e_s_p50": 98.44695,
+  "e2e_s_p95": 240.1996,
+  "wait_s_mean": 554.975902,
+  "decode_sources": {
+   "local": 0.8444944708696933,
+   "peer": 0.0,
+   "nvme": 0.15550552913030674,
+   "nvme_tmp": 0.0
+  },
+  "prefill_sources": {
+   "local": 0.5549196695422925,
+   "peer": 0.0,
+   "nvme": 0.0,
+   "nvme_tmp": 0.4450803304577074
+  },
+  "peer_miss": 0,
+  "admitted_from_peer": 0,
+  "overlap_jaccard_mean": null,
+  "overlap_final": null,
+  "nvme_gb_s": 1.6238929052097435,
+  "link_gb_s": 0.0,
+  "turns_per_box": [
+   25,
+   25
+  ],
+  "busy_skips": 0,
+  "box_done_s": [
+   1343.7000909689996,
+   636.6065340259993
+  ],
+  "errors": 0
+ },
+ "router": {
+  "box0": {
+   "sessions": 32,
+   "sessions_box0": 32,
+   "turns": 32,
+   "mode": "category",
+   "placement": {
+    "science->0": 10,
+    "math->0": 11,
+    "code->0": 11
+   }
+  },
+  "box1": {
+   "sessions": 32,
+   "sessions_box1": 32,
+   "turns": 32,
+   "mode": "category",
+   "placement": {
+    "general->1": 7,
+    "law->1": 6,
+    "writing->1": 7,
+    "finance->1": 6,
+    "medicine->1": 6
+   }
+  }
+ },
+ "box_stats": [
+  {
+   "rank": 0,
+   "counters": {
+    "experts": {
+     "prefill.local": 42245,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 41526,
+     "decode.local": 890050,
+     "decode.nvme": 256255,
+     "decode.nvme_tmp": 0
+    },
+    "pairs": {
+     "prefill.local": 727392,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 661536,
+     "decode.local": 1078614,
+     "decode.nvme": 273834,
+     "decode.nvme_tmp": 0
+    },
+    "served": {},
+    "admit": {},
+    "link": {},
+    "time_s": {
+     "prefill.route_plan": 1.0004953310599376,
+     "prefill.local": 71.11315659194588,
+     "decode.route_plan": 25.08757973876709,
+     "decode.local": 978.6527151392402
+    },
+    "steps": 883,
+    "decode_tokens": 3522,
+    "prefill_tokens": 3617,
+    "turns": 25,
+    "decode_share": {
+     "local": 0.7764512935039104,
+     "peer": 0.0,
+     "nvme": 0.2235487064960896,
+     "nvme_tmp": 0.0
+    },
+    "prefill_share": {
+     "local": 0.5042914612455385,
+     "peer": 0.0,
+     "nvme": 0.0,
+     "nvme_tmp": 0.4957085387544616
+    }
+   },
+   "cache": {
+    "slots": 2728,
+    "held": 2728,
+    "free": 0,
+    "dup_held": null,
+    "admissions": 256255,
+    "evictions": 256255,
+    "dup_evictions": 0
+   },
+   "nvme_reads": 297781,
+   "nvme_bytes": 1405450088064,
+   "peer_svc_ms_per_expert": null,
+   "info": {
+    "rank": 0,
+    "host": "run",
+    "device": "cuda",
+    "store_dtype": "float8_e4m3fn",
+    "compute_dtype": "bfloat16",
+    "slots": 2728,
+    "slot_mib": 4.50390625,
+    "cache_gib": 11.998687744140625,
+    "n_keys": 6144,
+    "kv_session_gib": 0.75,
+    "nvme_ms_per_expert": 1.2101907692307692,
+    "link": false
+   }
+  },
+  {
+   "rank": 1,
+   "counters": {
+    "experts": {
+     "prefill.local": 42792,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 26679,
+     "decode.local": 993866,
+     "decode.nvme": 90650,
+     "decode.nvme_tmp": 0
+    },
+    "pairs": {
+     "prefill.local": 558730,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 175478,
+     "decode.local": 1256926,
+     "decode.nvme": 95522,
+     "decode.nvme_tmp": 0
+    },
+    "served": {},
+    "admit": {},
+    "link": {},
+    "time_s": {
+     "prefill.route_plan": 0.7678283719760657,
+     "prefill.local": 44.77349964500172,
+     "decode.route_plan": 16.2325303176367,
+     "decode.local": 414.1883782505465
+    },
+    "steps": 883,
+    "decode_tokens": 3522,
+    "prefill_tokens": 1912,
+    "turns": 25,
+    "decode_share": {
+     "local": 0.9164143267595868,
+     "peer": 0.0,
+     "nvme": 0.08358567324041323,
+     "nvme_tmp": 0.0
+    },
+    "prefill_share": {
+     "local": 0.6159692533575161,
+     "peer": 0.0,
+     "nvme": 0.0,
+     "nvme_tmp": 0.38403074664248393
+    }
+   },
+   "cache": {
+    "slots": 2728,
+    "held": 2728,
+    "free": 0,
+    "dup_held": null,
+    "admissions": 90650,
+    "evictions": 90650,
+    "dup_evictions": 0
+   },
+   "nvme_reads": 117329,
+   "nvme_bytes": 553762843776,
+   "peer_svc_ms_per_expert": null,
+   "info": {
+    "rank": 1,
+    "host": "run",
+    "device": "cuda",
+    "store_dtype": "float8_e4m3fn",
+    "compute_dtype": "bfloat16",
+    "slots": 2728,
+    "slot_mib": 4.50390625,
+    "cache_gib": 11.998687744140625,
+    "n_keys": 6144,
+    "kv_session_gib": 0.75,
+    "nvme_ms_per_expert": 1.2101907692307692,
+    "link": false
+   }
+  }
+ ],
+ "overlap": [],
+ "errors": []
+}

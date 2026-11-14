@@ -1,0 +1,156 @@
+{
+ "boxes": [
+  {
+   "rank": 0,
+   "host": "run",
+   "device": "cuda",
+   "store_dtype": "float8_e4m3fn",
+   "compute_dtype": "bfloat16",
+   "slots": 2728,
+   "slot_mib": 4.50390625,
+   "cache_gib": 11.998687744140625,
+   "n_keys": 6144,
+   "kv_session_gib": 0.75,
+   "nvme_ms_per_expert": 1.2101907692307692,
+   "link": false
+  }
+ ],
+ "summary": {
+  "turns": 25,
+  "wall_s": 1206.4914660040013,
+  "total_s": 1343.7003511479998,
+  "out_tokens": 3200,
+  "tok_s": 2.6523188022196815,
+  "tpot_ms_p50": 1359.0359186456749,
+  "tpot_ms_p95": 1803.6080301889895,
+  "ttft_s_mean": 6.734761050999514,
+  "ttft_s_p95": 16.718634975000896,
+  "e2e_s_p50": 175.01934265800082,
+  "e2e_s_p95": 240.19960601599814,
+  "wait_s_mean": 775.9543600883999,
+  "decode_sources": {
+   "local": 0.7764512935039104,
+   "peer": 0.0,
+   "nvme": 0.2235487064960896,
+   "nvme_tmp": 0.0
+  },
+  "prefill_sources": {
+   "local": 0.5042914612455385,
+   "peer": 0.0,
+   "nvme": 0.0,
+   "nvme_tmp": 0.4957085387544616
+  },
+  "peer_miss": 0,
+  "admitted_from_peer": 0,
+  "overlap_jaccard_mean": null,
+  "overlap_final": null,
+  "nvme_gb_s": 1.1649067794229544,
+  "link_gb_s": 0.0,
+  "turns_per_box": [
+   25,
+   0
+  ],
+  "busy_skips": 0,
+  "box_done_s": [
+   1343.7000909689996,
+   null
+  ],
+  "errors": 0
+ },
+ "router": {
+  "sessions": 32,
+  "sessions_box0": 32,
+  "turns": 32,
+  "mode": "category",
+  "placement": {
+   "science->0": 10,
+   "math->0": 11,
+   "code->0": 11
+  }
+ },
+ "box_stats": [
+  {
+   "rank": 0,
+   "counters": {
+    "experts": {
+     "prefill.local": 42245,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 41526,
+     "decode.local": 890050,
+     "decode.nvme": 256255,
+     "decode.nvme_tmp": 0
+    },
+    "pairs": {
+     "prefill.local": 727392,
+     "prefill.nvme": 0,
+     "prefill.nvme_tmp": 661536,
+     "decode.local": 1078614,
+     "decode.nvme": 273834,
+     "decode.nvme_tmp": 0
+    },
+    "served": {},
+    "admit": {},
+    "link": {},
+    "time_s": {
+     "prefill.route_plan": 1.0004953310599376,
+     "prefill.local": 71.11315659194588,
+     "decode.route_plan": 25.08757973876709,
+     "decode.local": 978.6527151392402
+    },
+    "steps": 883,
+    "decode_tokens": 3522,
+    "prefill_tokens": 3617,
+    "turns": 25,
+    "decode_share": {
+     "local": 0.7764512935039104,
+     "peer": 0.0,
+     "nvme": 0.2235487064960896,
+     "nvme_tmp": 0.0
+    },
+    "prefill_share": {
+     "local": 0.5042914612455385,
+     "peer": 0.0,
+     "nvme": 0.0,
+     "nvme_tmp": 0.4957085387544616
+    }
+   },
+   "cache": {
+    "slots": 2728,
+    "held": 2728,
+    "free": 0,
+    "dup_held": null,
+    "admissions": 256255,
+    "evictions": 256255,
+    "dup_evictions": 0
+   },
+   "nvme_reads": 297781,
+   "nvme_bytes": 1405450088064,
+   "peer_svc_ms_per_expert": null,
+   "info": {
+    "rank": 0,
+    "host": "run",
+    "device": "cuda",
+    "store_dtype": "float8_e4m3fn",
+    "compute_dtype": "bfloat16",
+    "slots": 2728,
+    "slot_mib": 4.50390625,
+    "cache_gib": 11.998687744140625,
+    "n_keys": 6144,
+    "kv_session_gib": 0.75,
+    "nvme_ms_per_expert": 1.2101907692307692,
+    "link": false
+   }
+  }
+ ],
+ "overlap": [],
+ "errors": [],
+ "tag": "indep_cat_box0",
+ "workload": "64 requests",
+ "model": "Qwen/Qwen3-30B-A3B-Instruct-2507-FP8",
+ "overrides": [
+  "engine.max_sessions=4",
+  "engine.max_batch=4",
+  "link.enabled=false",
+  "bench.warmup_sessions=4"
+ ]
+}
