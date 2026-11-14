@@ -29,6 +29,7 @@ jobs:
       bash /opt/coopmoe/bootstrap.sh stage
     env:
       - HF_HOME={{DATA}}/hf-cache
+      - TORCH_INDEX=https://download.pytorch.org/whl/cpu
     files:
       /opt/coopmoe/bootstrap.sh: file://bootstrap.sh
       /opt/coopmoe/code.tgz.b64: file://code.tgz.b64

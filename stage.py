@@ -28,6 +28,8 @@ import time
 from driver import MODELS, REPO, S, block, bootstrap, fill, fuzzball, job_values, log, store_paths, submit, volume_name
 
 TIMEOUT = "12h"  # the download and the build; every other setting is driver.py's SETTINGS
+# The stage needs only CPU torch: a small image (pulled in seconds), not the ~20 GB NGC one.
+IMAGE = "docker://python:3.12-slim"
 
 
 UNITS = {"B": 1, "KB": 10**3, "MB": 10**6, "GB": 10**9, "TB": 10**12,
@@ -80,7 +82,7 @@ def ensure_volume(name: str, size: str) -> None:
 
 def render_stage(short: str) -> str:
     with open(os.path.join(REPO, "fuzzball", "stage.fz")) as f:
-        return fill(f.read(), {"BOOTSTRAP": block(bootstrap(short)), **job_values(short, TIMEOUT)})
+        return fill(f.read(), {"BOOTSTRAP": block(bootstrap(short)), **job_values(short, TIMEOUT), "IMAGE": IMAGE})
 
 
 def main(argv=None) -> None:
