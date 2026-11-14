@@ -1,0 +1,8 @@
+# What the Fuzzball jobs install (setup.sh). torch is installed separately (setup.sh picks the
+# right wheel index, or reuses the image's). make_requests.py runs locally and needs `datasets`.
+# The model, batching and tokenizer are Hugging Face's (needs Python >= 3.11).
+transformers==5.23.0
+numpy
+safetensors
+# Downloads checkpoints on the PGX boxes (stage job).
+huggingface_hub

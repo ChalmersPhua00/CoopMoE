@@ -1,0 +1,9 @@
+# The shell scripts and the workflow run on Linux (the PGX boxes): keep LF even when
+# committed from Windows with core.autocrlf=true.
+*.fz    text eol=lf
+*.sh    text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+*.py    text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf

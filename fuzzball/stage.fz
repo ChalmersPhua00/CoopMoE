@@ -1,0 +1,46 @@
+# Builds one model's expert store on the team's NFS volume, once (stage.py). Every
+# experiment job then copies it from there to each box's local disk.
+#
+# One node. The checkpoint downloads to this node's ephemeral volume (wiped afterwards), so the
+# NFS volume only has to hold the store (~243 GB for Qwen3-235B-A22B FP8).
+# Safe to resubmit: a finished store is skipped, and a half-built one is never visible.
+version: v4
+
+files:
+  bootstrap.sh: |
+{{BOOTSTRAP}}
+  code.tgz.b64: |
+{{CODE}}
+
+volumes:
+  data:
+    use: {{VOLUME_USE}}
+    name: {{VOLUME}}
+  local:
+    use: ephemeral
+    size: {{LOCAL_SIZE}}
+
+jobs:
+  stage:
+    image:
+      uri: {{IMAGE}}
+    script: |
+      #!/bin/bash
+      bash /opt/coopmoe/bootstrap.sh stage
+    env:
+      - HF_HOME={{DATA}}/hf-cache
+    files:
+      /opt/coopmoe/bootstrap.sh: file://bootstrap.sh
+      /opt/coopmoe/code.tgz.b64: file://code.tgz.b64
+    mounts:
+      {{DATA}}: data
+      {{LOCAL}}: local
+    resource:
+      cpu:
+        cores: {{CORES}}
+      memory:
+        size: {{MEMORY}}
+      exclusive: true
+    policy:
+      timeout:
+        execute: {{TIMEOUT}}
