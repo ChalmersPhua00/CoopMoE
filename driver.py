@@ -15,7 +15,7 @@ Each volume holds one model's expert store, so its name says which model to run.
   2. render   fuzzball/coopmoe.fz: one two-node job that carries this repo's code and the
               selected requests (fuzzball/bootstrap.sh runs on each node)
   3. submit   fuzzball workflow validate + start
-  4. inside   both nodes copy the expert store from the volume to their own ephemeral disk and
+  4. inside   both nodes copy the expert store from the volume to their own NVMe and
      the job  start their engine; PGX-A runs the requests through the scheduler with the model's
               run config as it is (configs/), and prints the results into the job log
   5. collect  follows the job log, then writes the results to results/<model>-<time>/:
@@ -57,7 +57,7 @@ MODELS = {
 SETTINGS = dict(
     provisioner="team1",                             # where the model volumes live
     data_root="/data/coopmoe",                       # the model's NFS volume, inside the job
-    local_root="/local", local_size="300GiB",        # each node's ephemeral disk: the store copy (~226 GiB for 235B)
+    local_root="/scratch", scratch="team1-scratch",  # each node's own NVMe, wiped per job: the store copy (~226 GiB for 235B)
     image="docker://nvcr.io/nvidia/pytorch:25.09-py3",
     gpus=1, cores=20, memory="120GiB",               # a whole GB10 box (unified memory: a hard limit)
     timeout="24h",
@@ -96,7 +96,7 @@ def store_paths(repo: str) -> dict:
     name = repo.rpartition("/")[2].lower()
     data, local = S.data_root, S.local_root
     return {"data": data, "local": local, "nfs_store": f"{data}/store/{name}",
-            "store": f"{local}/store/{name}", "hf": f"{local}/hf/{name}"}
+            "store": f"{local}/store/{name}", "hf": f"{data}/hf/{name}"}
 
 
 # ---------------------------------------------------------------------- the workflow
@@ -141,7 +141,7 @@ def job_values(short: str, timeout: str) -> dict:
     p = store_paths(MODELS[short][0])
     return {"CODE": block(code_archive()), "DATA": p["data"], "LOCAL": p["local"], "TIMEOUT": timeout,
             "VOLUME_USE": S.provisioner, "VOLUME": volume_name(short), "IMAGE": S.image,
-            "CORES": str(S.cores), "MEMORY": S.memory, "LOCAL_SIZE": S.local_size}
+            "CORES": str(S.cores), "MEMORY": S.memory, "SCRATCH": S.scratch}
 
 
 def render_workflow(short: str, picked: list[dict], cells: list) -> str:

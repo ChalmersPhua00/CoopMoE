@@ -175,5 +175,8 @@ def stage(model: str, store_dir: str, hf_dir: Optional[str] = None, log=print,
         convert_hf(src, partial, log=log)
         os.replace(partial, store_dir)
         log(f"[stage] store ready: {store_dir}")
+        if src != model:  # the download is only the store's source
+            shutil.rmtree(src)
+            log(f"[stage] deleted the download: {src}")
     finally:
         os.remove(lock)

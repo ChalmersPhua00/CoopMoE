@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Give one model its own NFS volume and build the model's expert store on it. Once per model.
 
-    python stage.py --model qwen3-235b-a22b --size 350GiB
+    python stage.py --model qwen3-235b-a22b --size 500GiB
     python stage.py --model qwen3-30b-a3b --size 80GiB
 
 Run it anywhere the `fuzzball` CLI is logged in to the cluster, before the first driver.py run
 with that model. It does two things, then stops:
 
 1. volume  team1/coopmoe-<model> is created at --size if missing, grown to --size if smaller,
-           never shrunk. Size it for the store (~243 GB for 235B, ~31 GB for 30B) plus results.
-2. stage   submits fuzzball/stage.fz: one node downloads the checkpoint to its ephemeral disk
-           (/local) and builds the expert store on that volume (/data/coopmoe/store/<model>),
-           then waits for it to finish.
+           never shrunk. Size it for the store (~243 GB for 235B, ~31 GB for 30B) plus, while
+           staging, a checkpoint download of about the same size.
+2. stage   submits fuzzball/stage.fz: one node downloads the checkpoint to that volume
+           (/data/coopmoe/hf/<model>), builds the expert store next to it
+           (/data/coopmoe/store/<model>), deletes the download, then waits for it to finish.
 
 It starts no experiment: driver.py --volume coopmoe-<model> does that, and reads the model from the name.
 Running it again is harmless: the volume is left as it is, and a finished store is skipped.
@@ -88,10 +89,10 @@ def render_stage(short: str) -> str:
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, type=str.lower, choices=list(MODELS), help="the model to stage")
-    ap.add_argument("--size", required=True, help="the model's volume size, e.g. 350GiB (grown to it, never shrunk)")
+    ap.add_argument("--size", required=True, help="the model's volume size, e.g. 500GiB (grown to it, never shrunk)")
     args = ap.parse_args(argv)
     if not to_bytes(args.size):
-        ap.error(f"--size {args.size!r} is not a size (e.g. 350GiB, 400GB)")
+        ap.error(f"--size {args.size!r} is not a size (e.g. 500GiB, 400GB)")
 
     short, name = args.model, volume_name(args.model)
     repo = MODELS[short][0]

@@ -34,7 +34,7 @@ source .venv/bin/activate
 pip install datasets
 
 python make_requests.py --out data/requests.json  # once: labeled requests
-python stage.py --model qwen3-235b-a22b --size 350GiB  # once per model
+python stage.py --model qwen3-235b-a22b --size 500GiB  # once per model
 python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 8
 ```
 
@@ -54,7 +54,7 @@ python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b 
 2. Submits [fuzzball/coopmoe.fz](fuzzball/coopmoe.fz): one job on two nodes. The repo's code
    and the requests travel inside the workflow file.
 3. Inside the job, [fuzzball/bootstrap.sh](fuzzball/bootstrap.sh) runs on each node. Both
-   nodes copy the store from the NFS volume to their own temporary disk (`/local`) and start
+   nodes copy the store from the NFS volume to their own NVMe (`/scratch`) and start
    their engine. PGX-A then runs the requests through the scheduler and prints the results
    into the job log.
 4. Follows the log, then writes `results/<model>-<time>/`:
@@ -73,7 +73,7 @@ model's run config in [configs/](configs/).
 - ~28 DGX Sparks: one GB10 GPU, 20 Arm cores and ~128 GiB of unified memory each. A 2-node
   job's hostnames are `<job>-0`, `<job>-1` (`run-0`, `run-1` here).
 - Persistent volumes are on NFS (`10.10.11.1:/hackathon/team-01`), the same files on both
-  boxes. A box's own disk is only reachable as an `ephemeral` volume, wiped when the job ends.
+  boxes. A box's own NVMe is reachable as the `team1-scratch` volume, wiped when the job ends.
   Hence: build the store once on NFS, copy it to each box at job start.
 - Memory requests are hard limits, and the GPU allocates from the same memory.
 - Fuzzball treats a double brace anywhere in a workflow file (comments too) as a template.

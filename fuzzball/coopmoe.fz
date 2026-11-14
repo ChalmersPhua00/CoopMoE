@@ -12,9 +12,9 @@
 #   data   the team's persistent volume: NFS (10.10.11.1:/hackathon/team-01), the SAME files
 #          on both boxes. Holds the one expert store (built once by fuzzball/stage.fz), the
 #          calibration files and the results.
-#   local  an ephemeral volume: per node, wiped when the job ends. Each box copies the store
-#          here at job start and reads its expert misses from it, as the design assumes.
-#          Unconfirmed: that it is the box's own NVMe, and that it can be this large (U2).
+#   scratch  each node's own NVMe (a hostpath volume: /dev/nvme0n1p2 on the node), wiped when
+#          the job ends. Each box copies the store here at job start and reads its expert
+#          misses from it, as the design assumes.
 version: v4
 
 files:
@@ -29,9 +29,8 @@ volumes:
   data:
     use: {{VOLUME_USE}}
     name: {{VOLUME}}
-  local:
-    use: ephemeral
-    size: {{LOCAL_SIZE}}
+  scratch:
+    use: {{SCRATCH}}
 
 jobs:
   run:
@@ -52,7 +51,7 @@ jobs:
       /opt/coopmoe/requests.json: file://requests.json
     mounts:
       {{DATA}}: data
-      {{LOCAL}}: local
+      {{LOCAL}}: scratch
     resource:
       cpu:
         cores: {{CORES}}
