@@ -1,0 +1,52 @@
+# The baseline: ONE PGX box (DGX Spark, GB10) serving its requests with stock Hugging Face
+# transformers, as a single-node Fuzzball workflow (v4 syntax). driver.py fills in every
+# double-brace placeholder and starts it twice, once per box; the two jobs never talk.
+#
+#   data     the model's NFS volume (made by stage.py on main): the original checkpoint is
+#            downloaded into hf/ on it once
+#   scratch  this node's own NVMe, wiped when the job ends: the checkpoint is copied here,
+#            and HF offloads the weights that do not fit in memory here
+# payload.b64 is baseline.py, requirements.txt and this box's requests as a base64 tar.gz
+# (Fuzzball treats a double brace anywhere in this file as a template, and requests contain them).
+version: v4
+
+files:
+  bootstrap.sh: |
+{{BOOTSTRAP}}
+  payload.b64: |
+{{PAYLOAD}}
+
+volumes:
+  data:
+    use: {{VOLUME_USE}}
+    name: {{VOLUME}}
+  scratch:
+    use: {{SCRATCH}}
+
+jobs:
+  run:
+    image:
+      uri: {{IMAGE}}
+    script: |
+      #!/bin/bash
+      bash /opt/baseline/bootstrap.sh
+    env:
+      - HF_HOME={{DATA}}/hf-cache
+    files:
+      /opt/baseline/bootstrap.sh: file://bootstrap.sh
+      /opt/baseline/payload.b64: file://payload.b64
+    mounts:
+      {{DATA}}: data
+      {{LOCAL}}: scratch
+    resource:
+      cpu:
+        cores: {{CORES}}
+      # Unified memory: a hard limit, the same as a CoopMoE box on main.
+      memory:
+        size: {{MEMORY}}
+      devices:
+        nvidia.com/gpu: {{GPUS}}
+      exclusive: true
+    policy:
+      timeout:
+        execute: {{TIMEOUT}}

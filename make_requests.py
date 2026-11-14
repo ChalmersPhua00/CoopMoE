@@ -9,13 +9,17 @@ streamed and shuffled with a fixed seed, so a rerun writes the same file. Each r
 dataset's own answer as "reference": the benchmark feeds it back as conversation history, and
 `coopmoe trace-hf` traces it as the reply.
 
-    [{"id": "code-0000", "category": "code", "source": "ise-uiuc/Magicoder-OSS-Instruct-75K",
+    [{"id": "code-0000", "category": "code", "box": 0, "source": "ise-uiuc/Magicoder-OSS-Instruct-75K",
       "request": "...", "reference": "..."},
      ...]
 
-The categories are finer than the two boxes on purpose. router.box_categories in the run config
-decides which box serves which categories, so the partition can change without regenerating
-this file. `coopmoe split` shows which partition separates the experts best.
+Each record also says which PGX box serves it ("box": 0 or 1; null for a category no box
+serves). The split is random, not by topic: half of every category goes to each box
+(assign_boxes below), so both boxes need the same experts and a box's miss is likely to be
+in the other box's memory. This is the only place requests are split between the boxes: the
+linked run (main) and the vanilla-HF baseline (branch baseline) both read "box" from this file,
+so they serve exactly the same requests on the same box. Changing the split means rerunning
+this script. select() below is what both drivers use to take --num requests per box from it.
 
 Needs `pip install datasets` (in requirements.txt).
 """
@@ -26,6 +30,7 @@ import ast
 import html
 import json
 import os
+import random
 import re
 import statistics
 import sys
@@ -98,6 +103,26 @@ def _dolly(*kinds: str) -> Source:
                   keep=lambda r: r["category"] in kinds)
 
 
+# Categories no box serves: in the file, with "box": null.
+UNSERVED = ["chinese"]
+
+
+def assign_boxes(records: list[dict], seed: int = 0) -> list[dict]:
+    """Sets "box" on every record: each served category is shuffled (fixed seed) and dealt
+    alternately to box 0 and box 1, so the two boxes get the same mix of topics."""
+    by_cat: dict[str, list[dict]] = {}
+    for r in records:
+        r["box"] = None
+        if r["category"] not in UNSERVED:
+            by_cat.setdefault(r["category"], []).append(r)
+    for category, rs in by_cat.items():
+        order = list(range(len(rs)))
+        random.Random(f"{seed}:{category}").shuffle(order)
+        for n, i in enumerate(order):
+            rs[i]["box"] = n % 2
+    return records
+
+
 SOURCES: dict[str, list[Source]] = {
     "code": [
         Source("ise-uiuc/Magicoder-OSS-Instruct-75K", lambda r: (r["problem"], r["solution"])),
@@ -136,6 +161,31 @@ SOURCES: dict[str, list[Source]] = {
         Source("silk-road/alpaca-data-gpt4-chinese", lambda r: (_join(r["instruction_zh"], r["input_zh"]), r["output_zh"])),
     ],
 }
+
+
+# ---------------------------------------------------------------------- selecting a run's requests
+def select(requests: list[dict], num: int, seed: int = 0) -> list[dict]:
+    """num requests for each box, from the records make_requests.py assigned to it, spread evenly
+    over that box's categories (first ones in the file first), in a fixed random order. Records
+    with no box are left out. driver.py calls this on both branches (the linked run on main, the
+    stock-HF baseline on baseline), so both serve the same requests on the same boxes."""
+    picked, short = [], []
+    for box in (0, 1):
+        by_cat: dict[str, list[dict]] = {}
+        for r in requests:
+            if r.get("box") == box:
+                by_cat.setdefault(r["category"], []).append(r)
+        if not by_cat:
+            raise ValueError(f"no request is assigned to box {box}: regenerate the file with make_requests.py")
+        for i, (c, have) in enumerate(by_cat.items()):
+            m = num // len(by_cat) + (i < num % len(by_cat))
+            if m > len(have):
+                short.append(f"{c} needs {m}, the file has {len(have)}")
+            picked += have[:m]
+    if short:
+        raise ValueError("not enough requests: " + "; ".join(short))
+    random.Random(seed).shuffle(picked)
+    return picked
 
 
 # ---------------------------------------------------------------------- sampling
@@ -215,20 +265,22 @@ def main(argv=None) -> None:
     for category in categories:
         log(f"{category}: {', '.join(s.repo for s in SOURCES[category])}")
         got = sample_category(category, args.per_category, args.seed, args.min_chars, args.max_chars, log)
-        records += [dict(id=f"{category}-{i:04d}", category=category, **r) for i, r in enumerate(got)]
+        records += [dict(id=f"{category}-{i:04d}", category=category, box=None, **r) for i, r in enumerate(got)]
+    assign_boxes(records, args.seed)
     write_requests(args.out, records)
 
     print(f"{args.out}: {len(records)} requests")
-    print(f"{'category':<10} {'requests':>8} {'median request chars':>21} {'median reference chars':>23}  sources")
+    print(f"{'category':<10} {'box 0/1':>9} {'requests':>8} {'median request chars':>21} {'median reference chars':>23}  sources")
     for category in categories:
         rs = [r for r in records if r["category"] == category]
         if not rs:
-            print(f"{category:<10} {0:>8}")
+            print(f"{category:<10} {'-':>9} {0:>8}")
             continue
         per_src = {}
         for r in rs:
             per_src[r["source"]] = per_src.get(r["source"], 0) + 1
-        print(f"{category:<10} {len(rs):>8} {statistics.median(len(r['request']) for r in rs):>21.0f} "
+        split = "/".join(str(sum(r["box"] == b for r in rs)) for b in (0, 1))
+        print(f"{category:<10} {split:>9} {len(rs):>8} {statistics.median(len(r['request']) for r in rs):>21.0f} "
               f"{statistics.median(len(r['reference']) for r in rs):>23.0f}  "
               + ", ".join(f"{s} {k}" for s, k in per_src.items()))
 
