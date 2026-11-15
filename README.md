@@ -14,7 +14,7 @@ cache per box (85 did not fit next to the rest in the 120 GiB job).
 - **A box that misses asks the other box before its own disk.** The other box runs the expert
   where it sits, so only kilobytes of activations cross the link.
 
-![CoopMoE architecture](CoopMoE.drawio.png)
+![CoopMoE architecture](CoopMoE.png)
 
 **Built on Hugging Face transformers (5.23.0).** Each box runs HF's `Qwen3MoeForCausalLM`
 under HF's continuous batching (the loop `transformers serve` uses), with one change: each
