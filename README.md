@@ -8,15 +8,16 @@
 > the traffic makes them), while on `main` a box can run a miss on the other box's copy.
 
 Two DGX Spark (GB10) boxes serve concurrent requests to an MoE model that is larger than both
-boxes' memory combined: Qwen3-235B-A22B FP8 has ~227 GB of experts, against ~85 GB of expert
-cache per box.
+boxes' memory combined: Qwen3-235B-A22B FP8 has ~227 GB of experts, against 70 GiB of expert
+cache per box (85 did not fit next to the rest in the 120 GiB job).
 
 - **Both boxes serve.** Each box runs its own requests, several at a time (`--concurrency`,
   default 4), batched.
 - **Requests are split at random.** `make_requests.py` deals half of every category (code, math,
   writing, ...) to each box (`"box"` in the requests file), so both boxes need the same experts.
-  Duplicate-first eviction then keeps their caches different, so a box's miss is likely to
-  be in the other box's memory.
+  There is no scheduler: a request is served on the box the file names, and never moves.
+  Duplicate-first eviction keeps the two caches different, so a box's miss is likely to be in
+  the other box's memory.
 - **A box that misses asks the other box before its own disk.** The other box runs the expert
   where it sits, so only kilobytes of activations cross the link.
 
@@ -26,10 +27,13 @@ cache per box.
 under HF's continuous batching (the loop `transformers serve` uses), with one change: each
 layer's `mlp.experts` is replaced, so the router's top-k choice goes to CoopMoE's expert path
 (own cache, other box, own disk) instead of HF's resident expert weights. Attention, routing,
-KV cache, batching, sampling and the tokenizer are HF's. Vanilla HF is then a like-for-like
-baseline: the same model and batching loop with the stock experts. It lives on the `baseline`
-branch, which is only that: the same `driver.py` command there runs the same requests on the
-same boxes with stock HF.
+KV cache, batching, sampling and the tokenizer are HF's.
+
+**Baseline:** the `baseline` branch is this branch with `"link": {"enabled": false}` in the run
+configs, nothing else. Each box keeps the same 70 GiB LRU cache and reads its misses from its
+own NVMe, but never asks the other box (and with no peer, duplicate-first eviction has nothing
+to act on). The same `driver.py` command there runs the same requests on the same boxes, so the
+only difference measured is the link.
 
 ## Running it
 
@@ -45,7 +49,7 @@ pip install datasets
 
 python make_requests.py --out data/requests.json  # once: labeled requests
 python stage.py --model qwen3-235b-a22b --size 500GiB  # once per model
-python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 8
+python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 4
 ```
 
 **[stage.py](stage.py)** `--model` (`qwen3-235b-a22b` or `qwen3-30b-a3b`) `--size` (both required)
@@ -67,23 +71,23 @@ python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b 
 3. Inside each job, [fuzzball/bootstrap.sh](fuzzball/bootstrap.sh) writes its node's CX-7
    address (`<node>-storage`, 10.10.11.x) to the NFS volume and waits for the other job's, so
    the engines talk over the CX-7 link. Both then copy the store from the NFS volume to their
-   own NVMe (`/scratch`) and start their engine. Box 0 (PGX-A) runs the requests through the
-   scheduler, prints the results into its job log and stops both engines.
+   own NVMe (`/scratch`) and start their engine. Box 0 (PGX-A) sends each request to its box,
+   prints the results into its job log, writes them to the NFS volume
+   (`/data/coopmoe/results/<workflow id>/`) and stops both engines.
    - Fuzzball sometimes puts both jobs' scratch volumes on one node; the second job then
      cannot start, box 0 gives up after 2 minutes, and `driver.py` submits both again.
 4. Follows both logs, then writes `results/<model>-<time>/`:
    - `report.md`: `run s` (first request sent → last request finished, all requests) and
      `run tok/s` (every generated token over that), then throughput after warm-up, time per
      token, time to first token, latency, where experts came from (own cache / other box /
-     disk), cache overlap. The baseline branch reports `run s` and `run tok/s` between the
-     same two points, so those two columns are the head-to-head comparison.
+     disk), cache overlap. The baseline branch writes the same report, so every column compares.
    - `<setup>_outputs.jsonl`: one line per request, with its timings and generated text
    - `<setup>.json`, `overlap.csv`, `requests.json`, `box0.fz`, `box1.fz`, `job.log` (box 0), `box1.log`
 
 Everything else is fixed in `SETTINGS` at the top of `driver.py` (provisioner `team1`, mounts,
 image, 1 GPU / 20 cores / 120 GiB per node, timeouts), and `stage.py` uses the same values.
-To change the engines or the scheduler (`cache.gb`, link on/off, routing mode), edit the
-model's run config in [configs/](configs/).
+To change the engines (`cache.gb`, link on/off), edit the model's run config in
+[configs/](configs/).
 
 ## The cluster (fb-hack)
 
@@ -141,15 +145,15 @@ make_requests.py    once: labeled requests from public datasets -> data/requests
 driver.py           one experiment: requests + volume -> Fuzzball job on both boxes -> results/
 fuzzball/           stage.fz, coopmoe.fz (job templates), bootstrap.sh (what each node runs)
 coopmoe/            the engine, run inside the jobs as python -m coopmoe stage | engine | run
-  run.py            the experiment on PGX-A: engine, requests through the scheduler, report
-  router.py         scheduler: category -> box, or round-robin; --concurrency slots per box
+  run.py            the experiment on PGX-A: engine, each request to its box, report
   engine.py         one box: HF continuous batching, step hooks, message server
   moe.py            per expert: own cache / other box / own disk, and serving the other box
   cache.py          the LRU expert cache, duplicate-first eviction, residency bitmap
   peer.py           the link to the other box (activations and residency bitmaps only)
   model.py          HF Qwen3-MoE with each layer's experts swapped for CoopMoE's
   store/            store format, checkpoint -> store converter, fast disk reader
-  transport.py      TCP messages; bench.py, report.py: measurements and results;
+  transport.py      TCP messages; bench.py: per-box queues (--concurrency at a time) and
+                    measurements; report.py: results;
                     workload.py: chat format; config.py, stats.py, cli.py
 configs/            qwen3_235b_a22b_fp8.json (target), qwen3_30b_a3b_fp8.json (development)
 setup.sh, env.sh    the job's Python environment (reuses the image's torch; needs Python >= 3.11)

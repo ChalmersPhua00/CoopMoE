@@ -1,7 +1,7 @@
 # ONE box of a CoopMoE experiment on the team's two PGX boxes (DGX Spark, GB10), as a
 # single-node Fuzzball workflow (v4 syntax). driver.py fills in every double-brace placeholder
 # and starts it twice, once per box, at the same time:
-#   run     box 0 (PGX-A): starts box 0's engine, runs the requests through the scheduler,
+#   run     box 0 (PGX-A): starts box 0's engine, sends each request to its box,
 #           prints the results into this job's log
 #   engine  box 1 (PGX-B): serves as box 1 until box 0 stops it
 # Two jobs instead of one two-node job because Fuzzball refuses a multinode job that mounts a

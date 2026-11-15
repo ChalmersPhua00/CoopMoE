@@ -14,12 +14,12 @@ new token per request: misses are admitted to the cache) or contains prompt toke
 a transient buffer); after it, the step count and a residency-bitmap push if the cache changed.
 
 Threads: HF's generation loop, a result thread (hands finished requests back, pushes the bitmap
-while idle), one server thread per connection (scheduler turns block until done; peer requests
+while idle), one server thread per connection (bench turns block until done; peer requests
 run immediately, on their own CUDA stream), drive readers, the link thread and the admission
 thread.
 
 Ops (TcpServer -> Box.handle):
-    scheduler: turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
+    bench:  turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
     peer:   compute, bitmap
 """
 from __future__ import annotations

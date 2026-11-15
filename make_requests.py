@@ -6,8 +6,7 @@
 
 Each category draws from one or more Hugging Face datasets (all ungated). Every dataset is
 streamed and shuffled with a fixed seed, so a rerun writes the same file. Each record keeps the
-dataset's own answer as "reference": the benchmark feeds it back as conversation history, and
-`coopmoe trace-hf` traces it as the reply.
+dataset's own answer as "reference" (not used by the benchmark, which generates its own reply).
 
     [{"id": "code-0000", "category": "code", "box": 0, "source": "ise-uiuc/Magicoder-OSS-Instruct-75K",
       "request": "...", "reference": "..."},
@@ -17,7 +16,7 @@ Each record also says which PGX box serves it ("box": 0 or 1; null for a categor
 serves). The split is random, not by topic: half of every category goes to each box
 (assign_boxes below), so both boxes need the same experts and a box's miss is likely to be
 in the other box's memory. This is the only place requests are split between the boxes: the
-linked run (main) and the vanilla-HF baseline (branch baseline) both read "box" from this file,
+linked run (main) and the baseline (branch baseline: the link off) both read "box" from this file,
 so they serve exactly the same requests on the same box. Changing the split means rerunning
 this script. select() below is what both drivers use to take --num requests per box from it.
 
@@ -154,8 +153,7 @@ SOURCES: dict[str, list[Source]] = {
     "general": [
         _dolly("open_qa", "general_qa", "brainstorming"),
     ],
-    # A language, not a topic. Qwen models often split their experts by language more sharply
-    # than by subject, so `coopmoe split` gets the chance to show whether that is the better axis.
+    # A language, not a topic; no box serves it (UNSERVED).
     "chinese": [
         Source("shibing624/alpaca-zh", lambda r: (_join(r["instruction"], r["input"]), r["output"])),
         Source("silk-road/alpaca-data-gpt4-chinese", lambda r: (_join(r["instruction_zh"], r["input_zh"]), r["output_zh"])),
@@ -168,7 +166,7 @@ def select(requests: list[dict], num: int, seed: int = 0) -> list[dict]:
     """num requests for each box, from the records make_requests.py assigned to it, spread evenly
     over that box's categories (first ones in the file first), in a fixed random order. Records
     with no box are left out. driver.py calls this on both branches (the linked run on main, the
-    stock-HF baseline on baseline), so both serve the same requests on the same boxes."""
+    baseline with the link off on baseline), so both serve the same requests on the same boxes."""
     picked, short = [], []
     for box in (0, 1):
         by_cat: dict[str, list[dict]] = {}

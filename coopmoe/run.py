@@ -4,8 +4,8 @@
              copied it to this box's local disk)
   2. start   this box's engine as a child process; box 1's engine is started on PGX-B by
              the other Fuzzball job of the pair
-  3. run     the requests through the scheduler once per cell: each request goes to a box (by
-             category, or round-robin) and each box serves engine.max_sessions at a time
+  3. run     the requests once per cell: each goes to the box make_requests.py assigned it to,
+             and each box serves engine.max_sessions at a time
   4. report  <out>/report.md, <out>/<cell>.json, <out>/<cell>_outputs.jsonl; then both engines stop
 
 With emit, every result also goes to stdout as '@@coopmoe <kind> <i>/<n> <base64 chunk>' lines

@@ -1,14 +1,15 @@
-"""Measurement for driver.py: replays the selected requests through the scheduler against both
-boxes, one cell at a time, and computes the metrics.
+"""Measurement for driver.py: replays the selected requests against both boxes, one cell at a
+time, and computes the metrics.
 
-A cell is a tag plus config overrides. Router and bench overrides apply here; the same overrides
-go to both engines with the reset (cache.*, link.*, ...), so several cells (an evaluation's
-setups) run on the same two engine processes, one after another.
+A cell is a tag plus config overrides. Bench overrides apply here; the same overrides go to both
+engines with the reset (cache.*, link.*, ...), so several cells (an evaluation's setups) run on
+the same two engine processes, one after another.
 
 Every request is a single turn: its prompt, then exactly bench.max_new_tokens generated tokens.
-All requests arrive at the start, in order. The scheduler assigns each one to a box, and each
-box works through its own queue with engine.max_sessions requests in flight, so a box never
-idles while it has requests waiting.
+All requests arrive at the start, in order. Each goes to the box make_requests.py assigned it
+to ("box": a random half of every category per box); nothing here decides placement. Each box
+works through its own queue with engine.max_sessions requests in flight, so a box never idles
+while it has requests waiting, and a request never moves to the other box.
 
 Metrics per cell: aggregate output tok/s, time per output token (median, p95), TTFT, end-to-end
 latency on the box (dispatch to last token) and the wait before dispatch, where routed experts
@@ -28,7 +29,6 @@ from typing import Optional
 import numpy as np
 
 from coopmoe.config import RunConfig
-from coopmoe.router import Router
 from coopmoe.stats import SOURCES
 from coopmoe.transport import TcpClient
 from coopmoe.workload import Formatter
@@ -94,11 +94,12 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
     b = cfg.bench
     pool.both({"op": "quiesce"})
     infos = [rh["info"] for rh, _ in pool.both({"op": "reset", "overrides": overrides, "epoch": epoch})]
-    router = Router(cfg.router, cfg.engine.max_sessions, pool.call, log)
     lock = threading.Lock()
     queues: list[list] = [[], []]
     for r in requests:
-        queues[router.assign(r)].append(r)
+        if r.get("box") not in (0, 1):
+            raise ValueError(f"request {r.get('id')!r} has no box: regenerate the requests with make_requests.py")
+        queues[r["box"]].append(r)
     records: list[dict] = []
     errors: list[str] = []
     progress = {"done": 0, "t_measure": None, "box_done": [None, None]}
@@ -137,10 +138,10 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
 
     def run_request(r: dict, box: int) -> None:
         sid = f"e{epoch}:{r['id']}"
-        router.open(sid, box)
         try:
             t0 = time.perf_counter()
-            rh = router.run_turn(sid, fmt.prompt(r["request"]), b.max_new_tokens)
+            rh, _ = pool.call(box, {"op": "turn", "sid": sid, "ids": list(fmt.prompt(r["request"])),
+                                    "max_new": int(b.max_new_tokens)})
             t1 = time.perf_counter()
             times, n = rh["times"], len(rh["tokens"])
             rec = {"id": r["id"], "category": r["category"], "box": rh["box"],
@@ -156,8 +157,6 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
             with lock:
                 errors.append(f"{sid}: {exc}")
             log(f"[bench] {sid} failed: {exc}")
-        finally:
-            router.close(sid)
         finished(box)
 
     def finished(box: int) -> None:
@@ -192,7 +191,7 @@ def run_cell(cfg: RunConfig, pool: BoxPool, requests: list[dict], fmt: Formatter
     summary = summarize(records, samples, stats, progress["t_measure"] or t_start, t_end, t_start)
     summary["box_done_s"] = progress["box_done"]
     summary["errors"] = len(errors)
-    return {"boxes": infos, "summary": summary, "router": router.summary(), "box_stats": stats,
+    return {"boxes": infos, "summary": summary, "box_stats": stats,
             "overlap": samples, "turns": records, "errors": errors}
 
 
