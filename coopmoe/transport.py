@@ -1,4 +1,4 @@
-"""Messaging between router and engines and between the two engines: a JSON header plus raw
+"""Messaging between the bench and the engines and between the two engines: a JSON header plus raw
 tensor payloads, over TCP. One request/response at a time per connection.
 
 This TCP path is the portable baseline: it runs on a laptop and over the CX-7 link's IP

@@ -5,8 +5,6 @@
   "cache": {"gb": 12, "dup_first": true, "dup_protect_steps": 0},
   "link": {"enabled": true, "busy_fallback": true},
   "engine": {"max_batch": 4, "max_sessions": 4, "max_seq": 8192, "n_transient": 32},
-  "_router": "category: each request goes to the box make_requests.py assigned it to (\"box\" in the requests file).",
-  "router": {"mode": "category"},
   "cluster": {"addrs": ["pgx-a:29600", "pgx-b:29600"], "connect_timeout": 3600},
   "reader": {"threads": 8, "direct_io": true},
   "bench": {"warmup_sessions": 8,

@@ -1,7 +1,7 @@
 """Model shape (read from the checkpoint) and run knobs (read from a JSON file).
 
 Run configs live in configs/*.json. Overrides are section.field=value strings, e.g.
-cache.gb=60 or router.mode=round_robin (a list value is JSON). driver.py uses them to point the
+cache.gb=60 or link.enabled=false (a list value is JSON). driver.py uses them to point the
 engines at their store and addresses; a cell's overrides go to both engines with the reset.
 """
 from __future__ import annotations
@@ -82,14 +82,9 @@ class LinkConfig:
 @dataclass
 class EngineConfig:
     max_batch: int = 4               # requests sharing one forward on a box (HF continuous batching)
-    max_sessions: int = 4            # requests in flight on a box (the router's cap; KV is sized for it)
+    max_sessions: int = 4            # requests in flight on a box (each box's cap; KV is sized for it)
     max_seq: int = 8192              # prompt + generated tokens per request
     n_transient: int = 16            # buffers for experts read without being admitted (prefill)
-
-
-@dataclass
-class RouterConfig:
-    mode: str = "category"           # category: each request's box from make_requests.py | round_robin: alternate
 
 
 @dataclass
@@ -119,7 +114,6 @@ class RunConfig:
     cache: CacheConfig = field(default_factory=CacheConfig)
     link: LinkConfig = field(default_factory=LinkConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
-    router: RouterConfig = field(default_factory=RouterConfig)
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     reader: ReaderConfig = field(default_factory=ReaderConfig)
     bench: BenchConfig = field(default_factory=BenchConfig)

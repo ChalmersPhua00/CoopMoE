@@ -2,7 +2,7 @@
 """Run labeled requests through CoopMoE on the two PGX boxes, set up by Fuzzball, and report.
 
     python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b
-    python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 8
+    python driver.py --requests data/requests.json --volume coopmoe-qwen3-235b-a22b --num 16 --concurrency 4
 
 Run it anywhere the `fuzzball` CLI is logged in to the cluster.
 
@@ -18,8 +18,8 @@ Each volume holds one model's expert store, so its name says which model to run.
   3. submit   fuzzball workflow validate + start, both at once
   4. inside   each job writes its node's CX-7 address to the NFS volume and waits for the
      the jobs other's (fuzzball/bootstrap.sh, rendezvous), copies the expert store from the volume
-              to its own NVMe and starts its engine; box 0 runs the requests through the
-              scheduler with the model's run config as it is (configs/), prints the results
+              to its own NVMe and starts its engine; box 0 sends each request to its box,
+              with the model's run config as it is (configs/), prints the results
               into its job log and stops both engines
   5. collect  follows both job logs, then writes the results to results/<model>-<time>/:
               report.md (throughput, TTFT, TPOT, latency, where experts came from), <setup>.json,
@@ -28,8 +28,8 @@ Each volume holds one model's expert store, so its name says which model to run.
      If box 1's job does not start (Fuzzball sometimes puts both jobs' scratch volumes on one
      node), box 0 gives up after SETTINGS rendezvous seconds and both jobs are submitted again.
 
-Everything else is fixed in SETTINGS below. To change the engines or the scheduler (cache.gb,
-link, router mode), edit the model's run config. experiment() is the same thing as a function,
+Everything else is fixed in SETTINGS below. To change the engines (cache.gb, link on/off), edit
+the model's run config. experiment() is the same thing as a function,
 for scripts that compare several setups.
 """
 from __future__ import annotations
@@ -161,7 +161,7 @@ def job_values(short: str, timeout: str, requests: list[dict] = ()) -> dict:
 
 def render_box(short: str, role: str, run_id: str, picked: list[dict], cells: list) -> str:
     """fuzzball/coopmoe.fz for one box. role: run (box 0: its engine and the experiment) or
-    engine (box 1). picked: the requests (box 0's job runs them all through the scheduler);
+    engine (box 1). picked: the requests (box 0's job sends each to its box);
     cells: [(tag, [KEY=VALUE, ...]), ...], for run."""
     q = shlex.quote
     run_args = [a for c in cells for a in ("--cell", " ".join([c[0], *c[1]]))]
@@ -328,9 +328,8 @@ def experiment(volume: str, requests: str, num: int = 64, concurrency: int | Non
     short, cfg, picked, conc = plan(volume, requests, num, concurrency)
     repo = MODELS[short][0]
     if cells is None:
-        mode, link = cfg.router.mode, cfg.link.enabled
-        cells = [(f"{'linked' if link else 'indep'}_{'cat' if mode == 'category' else 'rr'}", [])]
-    # Both engines and the scheduler take it with each setup's reset; a setup may still override it.
+        cells = [("linked" if cfg.link.enabled else "indep", [])]
+    # Both engines and the bench take it with each setup's reset; a setup may still override it.
     per_box = [f"engine.max_sessions={conc}", f"engine.max_batch={conc}"]
     cells = [(tag, per_box + list(overrides)) for tag, overrides in cells]
 

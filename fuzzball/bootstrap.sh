@@ -6,7 +6,7 @@
 #   stage   (stage.py, one node, once per model) download the checkpoint and build
 #           the expert store on the team's NFS volume
 #   run     (box 0, PGX-A) find box 1, copy the store from NFS to this box's local disk, start
-#           box 0's engine, run the requests through the scheduler, print the results
+#           box 0's engine, send each request to its box, print the results
 #   engine  (box 1, PGX-B) find box 0, copy the store from NFS to this box's local disk, serve
 #           as box 1 until box 0 stops it
 #
