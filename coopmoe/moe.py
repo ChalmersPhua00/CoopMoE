@@ -29,6 +29,15 @@ from coopmoe.stats import LOCAL, NVME, NVME_TMP, PEER, PEER_MISS
 from coopmoe.store.layout import expert_weights
 
 
+def _drain(stream=None) -> None:
+    """Wait until the GPU has run everything queued on `stream` (default: the current one).
+    A cache slot or transient buffer may only be given back after the kernels reading it ran:
+    the drive loader writes the next expert into it on its own stream, and pins only order
+    the host, not the GPU."""
+    if torch.cuda.is_available():
+        (stream or torch.cuda.current_stream()).synchronize()
+
+
 def expert_ffn(x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
     """SwiGLU expert: down(silu(gate(x)) * up(x)) with gate/up packed as w13."""
     h = x @ w13.t()
@@ -134,31 +143,37 @@ class MoeExecutor:
             p_tmp += int(ti.numel())
         # On an error keep going until every pin and buffer is given back, then raise the first one.
         err: BaseException | None = None
+        pinned = []  # released only once the GPU has run every kernel reading them
         for key, ti, w in hits:  # compute hits while the drive works on the misses
+            pinned.append(key)
             try:
                 if err is None:
                     self._apply(cache.slab[int(cache.slot_of[key])], x, ti, w, out)
             except BaseException as exc:
                 err = exc
-            finally:
-                cache.release(key)
-        for fut in as_completed(pending):
-            key, slot, ti, w = pending[fut]
-            try:
-                res = fut.result()
-            except BaseException as exc:  # a failed load already gave back its slot or buffer
-                err = err or exc
-                continue
-            try:
-                if err is None:
-                    self._apply(cache.slab[slot] if slot is not None else res, x, ti, w, out)
-            except BaseException as exc:
-                err = err or exc
-            finally:
+        try:
+            for fut in as_completed(pending):
+                key, slot, ti, w = pending[fut]
+                try:
+                    res = fut.result()
+                except BaseException as exc:  # a failed load already gave back its slot or buffer
+                    err = err or exc
+                    continue
                 if slot is not None:
-                    cache.release(key)
-                else:
-                    box.transients.put(res)
+                    pinned.append(key)
+                try:
+                    if err is None:
+                        self._apply(cache.slab[slot] if slot is not None else res, x, ti, w, out)
+                except BaseException as exc:
+                    err = err or exc
+                finally:
+                    if slot is None:
+                        _drain()  # a reader thread may be waiting for this buffer to load into it
+                        box.transients.put(res)
+        finally:
+            _drain()
+            for key in pinned:
+                cache.release(key)
         if err is not None:
             raise err
         if misses:
@@ -179,19 +194,22 @@ class MoeExecutor:
             w = w.to(box.device).to(x.dtype)
             layer, experts, counts = h["layer"], h["experts"], h["counts"]
             out = torch.zeros(x.shape[0], self.m.hidden_size, dtype=torch.float32, device=box.device)
-            miss = []
+            miss, pinned = [], []
             refresh = box.cfg.cache.remote_refresh
-            for e, ti, wi in zip(experts, torch.split(remap, counts), torch.split(w, counts)):
-                key = self.index.key(layer, e)
-                slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh)
-                if st is not Acquire.HIT:
-                    miss.append(e)
-                    continue
-                try:
+            try:
+                for e, ti, wi in zip(experts, torch.split(remap, counts), torch.split(w, counts)):
+                    key = self.index.key(layer, e)
+                    slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh)
+                    if st is not Acquire.HIT:
+                        miss.append(e)
+                        continue
+                    pinned.append(key)
                     self._apply(cache.slab[slot], x, ti, wi, out)
-                finally:
+                out = out.cpu()  # waits for this stream only
+            finally:
+                _drain(stream)
+                for key in pinned:
                     cache.release(key)
-            out = out.cpu()  # waits for this stream only
         svc = time.perf_counter() - t0
         c = box.counters
         c.add("served", "requests")
