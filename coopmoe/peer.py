@@ -1,4 +1,5 @@
-"""This box's side of the link to the other box.
+"""This box's side of the link to the other box: a miss the peer holds is copied from the
+peer's cache (fetch) and run here.
 
 PeerLink: per-layer compute requests (one message per MoE layer, activations out, partial sums
 back), residency-bitmap pushes, and the busy-peer estimate. Only activations and bitmaps cross
@@ -13,6 +14,8 @@ from typing import Optional
 import numpy as np
 import torch
 
+from coopmoe.transport import TcpClient
+
 
 class PeerLink:
     def __init__(self, box, layer_client, epoch: int):
@@ -25,8 +28,10 @@ class PeerLink:
         self.version = -1
         self.pushed_version = -1
         self._lock = threading.Lock()
-        self.svc_per_expert: Optional[float] = None  # EWMA of the peer's service time
+        self.svc_per_expert: Optional[float] = None  # EWMA of the time to copy one expert from the peer
         self._skips = 0
+        self._tls = threading.local()            # one fetch connection per loader thread
+        self._fetch_clients: list = []
 
     # -- residency ------------------------------------------------------------------
     def holds(self, key: int) -> bool:
@@ -67,7 +72,8 @@ class PeerLink:
         every probe_every-th layer still goes to the peer to refresh the estimate."""
         if self.bits is None:
             return False
-        if not self.busy_fallback or self.svc_per_expert is None or self.svc_per_expert <= self.nvme_s:
+        nvme_s = self.box.nvme_load_s  # measured on this box; unknown until its first drive read
+        if not self.busy_fallback or self.svc_per_expert is None or nvme_s is None or self.svc_per_expert <= nvme_s:
             return True
         self._skips += 1
         if self._skips >= self.probe_every:
@@ -75,6 +81,27 @@ class PeerLink:
             return True
         self.box.counters.add("link", "busy_skips")
         return False
+
+    # -- copying an expert from the peer ----------------------------------------------
+    def fetch(self, key: int) -> Optional[torch.Tensor]:
+        """The record of `key` from the peer's cache (host uint8), or None if it no longer
+        holds it. Called from the loader threads, each on its own connection."""
+        client = getattr(self._tls, "client", None)
+        if client is None:
+            client = self._tls.client = TcpClient(self.layer.addr, self.box.cfg.cluster.connect_timeout)
+            with self._lock:
+                self._fetch_clients.append(client)
+        rh, rt = client.call({"op": "fetch", "key": int(key)})
+        if not rt:
+            return None
+        c = self.box.counters
+        c.add("link", "fetch_in", rt[0].numel())
+        c.add("link", "fetches")
+        return rt[0]
+
+    def note_fetch(self, seconds: float) -> None:
+        s = self.svc_per_expert
+        self.svc_per_expert = seconds if s is None else 0.9 * s + 0.1 * seconds
 
     # -- per-layer compute ------------------------------------------------------------
     def compute_async(self, layer: int, items: list, x: torch.Tensor) -> Future:
@@ -101,8 +128,9 @@ class PeerLink:
 
     def close(self) -> None:
         self.pool.shutdown(wait=True)
-        try:
-            self.layer.close()
-        except Exception:
-            pass
+        for client in [self.layer, *self._fetch_clients]:
+            try:
+                client.close()
+            except Exception:
+                pass
 

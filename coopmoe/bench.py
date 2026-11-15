@@ -217,7 +217,7 @@ def summarize(records, samples, stats, t_measure, t_end, t_start) -> dict:
         return {k: src.get(f"{phase}.{k}", 0) / tot for k in SOURCES} if tot else {}
 
     msamples = [s for s in samples if s["measured"]] or samples
-    link_bytes = sum(v for k, v in link.items() if k in ("act_out", "partial_in", "bitmap_out"))
+    link_bytes = sum(v for k, v in link.items() if k in ("act_out", "partial_in", "bitmap_out", "fetch_in"))
     per_box = Counter(r["box"] for r in meas)
     return {
         "turns": len(meas), "wall_s": wall,
