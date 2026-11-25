@@ -170,7 +170,8 @@ class MoeExecutor:
 
     # ------------------------------------------------------------------ for the peer
     def serve_fetch(self, h: dict) -> tuple[dict, list]:
-        """The peer copies one expert out of this box's cache: its record's bytes, or MISS."""
+        """The peer copies one expert out of this box's cache: into serve[i] for the peer's RDMA
+        READ (h["rdma"] = i), or its bytes in the reply (tcp), or MISS."""
         box, cache = self.box, self.box.cache
         key = int(h["key"])
         slot, st = cache.acquire(key, reserve=False, local=False, refresh=box.cfg.cache.remote_refresh,
@@ -178,15 +179,18 @@ class MoeExecutor:
         if st is not Acquire.HIT:
             box.counters.add("served", "miss")
             return {"miss": True}, []
+        n, i = self.index.expert_bytes, h.get("rdma")
         try:
-            # A real copy, taken while the slot is pinned: the reply goes out after release(), when
-            # the slot may already hold another expert (.cpu() alone returns the slot itself on a
-            # CPU box). Synchronous.
-            blob = cache.slab[slot][: self.index.expert_bytes].to("cpu", copy=True)
+            # A real copy, taken while the slot is pinned: the slot may hold another expert as soon
+            # as it is released (.cpu() alone returns the slot itself on a CPU box). Synchronous.
+            if i is not None:  # serve[i] is only ever read by the peer's loader thread i
+                box.rdma.serve[int(i), :n].copy_(cache.slab[slot][:n])
+            else:
+                blob = cache.slab[slot][:n].to("cpu", copy=True)
         finally:
             cache.release(key)
         box.counters.add("served", "experts")
-        return {}, [blob]
+        return ({"rdma": True}, []) if i is not None else ({}, [blob])
 
     def serve_compute(self, h: dict, tensors: list) -> tuple[dict, list]:
         box, cache = self.box, self.box.cache

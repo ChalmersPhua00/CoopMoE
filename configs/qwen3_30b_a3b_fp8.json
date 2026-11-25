@@ -3,7 +3,7 @@
   "store_dir": "/data/coopmoe/store/qwen3-30b-a3b-fp8",
   "device": "cuda",
   "cache": {"gb": 12, "dup_first": true, "dup_protect_steps": 0},
-  "link": {"enabled": false, "busy_fallback": true},
+  "link": {"enabled": false, "transport": "rdma", "busy_fallback": true},
   "engine": {"max_batch": 4, "max_sessions": 4, "max_seq": 8192, "n_transient": 32},
   "cluster": {"addrs": ["pgx-a:29600", "pgx-b:29600"], "connect_timeout": 3600},
   "reader": {"threads": 8, "direct_io": true},

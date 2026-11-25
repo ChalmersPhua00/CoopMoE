@@ -104,7 +104,12 @@ To change the engines (`cache.gb`, link on/off), edit the model's run config in
 
 1. **In its own cache:** run it here.
 2. **Only in the other box's cache** (per that box's last residency bitmap): copy the
-   expert's bytes out of the other box's cache over the CX-7 link, then run it here.
+   expert's bytes out of the other box's cache over the CX-7 link, then run it here. The copy
+   is an RDMA READ (NVIDIA NIXL, UCX backend; `rdma.py`): this box asks over TCP, the other box
+   puts the expert in a registered buffer and replies, and this box reads it from there, so the
+   expert's bytes go through neither box's TCP stack. Pinned host buffers, because the GB10
+   has no GPUDirect RDMA. `"link": {"transport": "tcp"}` sends the bytes in the TCP reply
+   instead.
    - If the other box evicted it meanwhile (or is still reading it in), it replies `MISS` and
      this box reads it from disk.
    - If a copy from the other box currently takes longer than a read from this box's disk
@@ -155,6 +160,7 @@ coopmoe/            the engine, run inside the jobs as python -m coopmoe stage |
   moe.py            per expert: own cache / other box / own disk, and copies for the other box
   cache.py          the LRU expert cache, duplicate-first eviction, residency bitmap
   peer.py           the link to the other box (expert copies and residency bitmaps)
+  rdma.py           registered buffers and one-sided RDMA READs for expert copies (NIXL)
   model.py          HF Qwen3-MoE with each layer's experts swapped for CoopMoE's
   store/            store format, checkpoint -> store converter, fast disk reader
   transport.py      TCP messages; bench.py: per-box queues (--concurrency at a time) and

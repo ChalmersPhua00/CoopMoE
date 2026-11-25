@@ -20,8 +20,11 @@ from the other box, or a read from this box's drive) and the link thread (bitmap
 
 Ops (TcpServer -> Box.handle):
     bench:  turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
-    peer:   fetch, bitmap   (compute: the earlier design where the other box ran the expert;
-                             this version never sends it)
+    peer:   fetch, bitmap, rdma_info   (compute: the earlier design where the other box ran the
+                                        expert; this version never sends it)
+
+With link.transport=rdma (rdma.py) a fetch's reply only says the expert is in the agreed serve
+buffer, and the asking box RDMA-reads it from there; with tcp the bytes ride in the reply.
 """
 from __future__ import annotations
 
@@ -41,6 +44,7 @@ from coopmoe.cache import ExpertCache
 from coopmoe.config import RunConfig, apply_overrides
 from coopmoe.moe import MoeExecutor
 from coopmoe.peer import PeerLink
+from coopmoe.rdma import RdmaPlane
 from coopmoe.stats import NVME, PEER, PEER_MISS, Counters
 from coopmoe.store.layout import FP8, StoreIndex
 from coopmoe.store.reader import BufferPool, ExpertLoader, ExpertReader
@@ -76,6 +80,8 @@ class Box:
         self.peer_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None  # serve_compute only
         self.peer: Optional[PeerLink] = None
         self.nvme_load_s: Optional[float] = None  # measured seconds per expert read from the drive
+        self.rdma: Optional[RdmaPlane] = None    # registered buffers + NIXL agent, made on first use
+        self._rdma_lock = threading.Lock()
         self.epoch = 0
         self.step = 0
         self.decode = False
@@ -99,6 +105,8 @@ class Box:
 
     def _configure(self, cfg: RunConfig) -> None:
         """(Re)build what depends on knobs: cache and transient buffers."""
+        if cfg.link.transport not in ("rdma", "tcp"):
+            raise ValueError(f"link.transport must be rdma or tcp, got {cfg.link.transport!r}")
         self.cfg = cfg
         n = self._n_slots(cfg)
         if self.cache is None or self.cache.n_slots != n:
@@ -177,7 +185,8 @@ class Box:
                 "slots": self.cache.n_slots, "slot_mib": self.index.stride / 2**20,
                 "cache_gib": self.cache.n_slots * self.index.stride / 2**30, "n_keys": self.m.n_keys,
                 "kv_session_gib": self.kv_bytes_per_request() / 2**30,
-                "nvme_ms_per_expert": self.nvme_s_per_expert() * 1e3, "link": self.cfg.link.enabled}
+                "nvme_ms_per_expert": self.nvme_s_per_expert() * 1e3, "link": self.cfg.link.enabled,
+                "transport": self.cfg.link.transport}
 
     # ------------------------------------------------------------------ drive helpers
     def _fill(self, key: int, dst: torch.Tensor, from_peer: bool) -> str:
@@ -218,10 +227,23 @@ class Box:
         return buf, src
 
     # ------------------------------------------------------------------ peer link
+    def rdma_plane(self) -> RdmaPlane:
+        """This box's RDMA buffers (one serve and one landing buffer per loader thread) and NIXL
+        agent, made on first use and kept for the life of the process."""
+        with self._rdma_lock:
+            if self.rdma is None:
+                self.rdma = RdmaPlane(self.rank, self.cfg.reader.threads, self.index.stride,
+                                      self.index.expert_bytes, pin=self.device.type == "cuda")
+            return self.rdma
+
     def _open_peer(self) -> None:
         addr, t = self.cfg.cluster.addrs[1 - self.rank], self.cfg.cluster.connect_timeout
         self.peer = PeerLink(self, TcpClient(addr, t), self.epoch)
         self.cache.set_peer(None)
+        if self.cfg.link.transport == "rdma":  # learn where the peer's serve buffers are
+            plane = self.rdma_plane()
+            plane.connect(*self.peer.layer.call({"op": "rdma_info"}))
+            self.peer.rdma = plane
 
     def _close_peer(self) -> None:
         old, self.peer = self.peer, None
@@ -243,6 +265,8 @@ class Box:
                 return self.moe.serve_compute(h, tensors)
         if op == "fetch":
             return self.moe.serve_fetch(h)
+        if op == "rdma_info":
+            return self.rdma_plane().info()
         if op == "bitmap":
             if self.peer is not None:
                 self.peer.receive_bitmap(int(h["epoch"]), int(h["version"]), tensors[0])
