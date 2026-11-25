@@ -6,3 +6,5 @@ numpy
 safetensors
 # Downloads checkpoints on the PGX boxes (stage job).
 huggingface_hub
+# One-sided RDMA for expert copies between the boxes (link.transport=rdma; UCX backend).
+nixl==1.5.2

@@ -74,6 +74,9 @@ class CacheConfig:
 @dataclass
 class LinkConfig:
     enabled: bool = True             # False = two independent boxes: no peer path, no bitmaps
+    transport: str = "rdma"          # how a copied expert's bytes cross: rdma (one-sided READ through
+                                     # NIXL/UCX; the request and reply still use TCP) | tcp (the bytes
+                                     # ride in the TCP reply)
     busy_fallback: bool = True       # read own NVMe when the peer is slower than the drive
     probe_every: int = 32            # while the peer counts as busy, still try it every N layers
     nvme_ms_per_expert: Optional[float] = None  # reported only (default: expert size / 3.9 GB/s); the

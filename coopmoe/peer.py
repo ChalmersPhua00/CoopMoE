@@ -1,10 +1,12 @@
 """This box's side of the link to the other box: a miss the peer holds is copied from the
 peer's cache (fetch) and run here.
 
-PeerLink: expert copies (fetch: one connection per loader thread, the expert's bytes back),
-residency-bitmap pushes, and the busy-peer estimate (is a copy from the peer currently slower
-than a read from this box's drive?). Expert weights and bitmaps cross the link. compute_async
-(activations out, the peer's partial sums back) is the earlier design and is no longer called.
+PeerLink: expert copies (fetch: one TCP connection per loader thread for the request; the
+expert's bytes by RDMA READ from the peer's serve buffer with link.transport=rdma, or in the TCP
+reply with tcp), residency-bitmap pushes, and the busy-peer estimate (is a copy from the peer
+currently slower than a read from this box's drive?). Expert weights and bitmaps cross the link.
+compute_async (activations out, the peer's partial sums back) is the earlier design and is no
+longer called.
 """
 from __future__ import annotations
 
@@ -31,7 +33,9 @@ class PeerLink:
         self._lock = threading.Lock()
         self.svc_per_expert: Optional[float] = None  # EWMA of the time to copy one expert from the peer
         self._skips = 0
-        self._tls = threading.local()            # one fetch connection per loader thread
+        self._tls = threading.local()            # one fetch connection (and RDMA buffer index) per loader thread
+        self._n_fetch = 0
+        self.rdma = None                          # the box's RdmaPlane once connected (link.transport=rdma)
         self._fetch_clients: list = []
 
     # -- residency ------------------------------------------------------------------
@@ -85,20 +89,34 @@ class PeerLink:
 
     # -- copying an expert from the peer ----------------------------------------------
     def fetch(self, key: int) -> Optional[torch.Tensor]:
-        """The record of `key` from the peer's cache (host uint8), or None if it no longer
-        holds it. Called from the loader threads, each on its own connection."""
+        """The record of `key` from the peer's cache (host uint8, valid until this thread's next
+        fetch), or None if the peer no longer holds it. Called from the loader threads, each on
+        its own connection and with its own RDMA buffer index (the n-th thread to fetch gets n)."""
         client = getattr(self._tls, "client", None)
         if client is None:
+            with self._lock:
+                self._tls.index = self._n_fetch
+                self._n_fetch += 1
             client = self._tls.client = TcpClient(self.layer.addr, self.box.cfg.cluster.connect_timeout)
             with self._lock:
                 self._fetch_clients.append(client)
-        rh, rt = client.call({"op": "fetch", "key": int(key)})
-        if not rt:
-            return None
-        c = self.box.counters
-        c.add("link", "fetch_in", rt[0].numel())
+        c, i, rdma = self.box.counters, self._tls.index, self.rdma
+        if rdma is not None and i < rdma.n:
+            rh, _ = client.call({"op": "fetch", "key": int(key), "rdma": i})
+            if rh.get("miss"):
+                return None
+            if not rh.get("rdma"):
+                raise RuntimeError(f"peer answered an RDMA fetch without staging it: {rh}")
+            buf = rdma.read(i)
+            c.add("link", "rdma_reads")
+        else:
+            rh, rt = client.call({"op": "fetch", "key": int(key)})
+            if not rt:
+                return None
+            buf = rt[0]
+        c.add("link", "fetch_in", buf.numel())
         c.add("link", "fetches")
-        return rt[0]
+        return buf
 
     def note_fetch(self, seconds: float) -> None:
         s = self.svc_per_expert
