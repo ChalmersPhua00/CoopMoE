@@ -1,4 +1,4 @@
-"""One PGX box: serves its own requests and runs the other box's misses on experts it holds.
+"""One PGX box: serves its own requests, and hands the other box copies of experts in its cache.
 
 State on a box:
     non-expert weights   resident, never evicted (both boxes run attention)
@@ -14,13 +14,14 @@ new token per request: misses are admitted to the cache) or contains prompt toke
 a transient buffer); after it, the step count and a residency-bitmap push if the cache changed.
 
 Threads: HF's generation loop, a result thread (hands finished requests back, pushes the bitmap
-while idle), one server thread per connection (bench turns block until done; peer requests
-run immediately, on their own CUDA stream), drive readers, the link thread and the admission
-thread.
+while idle), one server thread per connection (bench turns block until done; the other box's
+fetches are answered right away, from this box's cache), the loader threads (a miss: a copy
+from the other box, or a read from this box's drive) and the link thread (bitmap pushes).
 
 Ops (TcpServer -> Box.handle):
     bench:  turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
-    peer:   compute, bitmap
+    peer:   fetch, bitmap   (compute: the earlier design where the other box ran the expert;
+                             this version never sends it)
 """
 from __future__ import annotations
 
@@ -40,7 +41,7 @@ from coopmoe.cache import ExpertCache
 from coopmoe.config import RunConfig, apply_overrides
 from coopmoe.moe import MoeExecutor
 from coopmoe.peer import PeerLink
-from coopmoe.stats import Counters
+from coopmoe.stats import NVME, PEER, PEER_MISS, Counters
 from coopmoe.store.layout import FP8, StoreIndex
 from coopmoe.store.reader import BufferPool, ExpertLoader, ExpertReader
 from coopmoe.transport import TcpClient, TcpServer
@@ -72,8 +73,9 @@ class Box:
         self.moe = MoeExecutor(self)
         self.model = hf_model.build(cfg.store_dir, self.moe, self.device, self.dtype)
         self.counters = Counters()
-        self.peer_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        self.peer_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None  # serve_compute only
         self.peer: Optional[PeerLink] = None
+        self.nvme_load_s: Optional[float] = None  # measured seconds per expert read from the drive
         self.epoch = 0
         self.step = 0
         self.decode = False
@@ -178,22 +180,42 @@ class Box:
                 "nvme_ms_per_expert": self.nvme_s_per_expert() * 1e3, "link": self.cfg.link.enabled}
 
     # ------------------------------------------------------------------ drive helpers
-    def load_and_commit(self, key: int, slot: int) -> None:
+    def _fill(self, key: int, dst: torch.Tensor, from_peer: bool) -> str:
+        """One expert's record into dst: copied from the peer's cache if asked and the peer
+        still holds it, else read from this box's drive. -> where it came from. Both paths are
+        timed (same threads, same parallelism): PeerLink.usable() compares them."""
+        src, peer = NVME, self.peer
+        if from_peer and peer is not None:
+            t0 = time.perf_counter()
+            blob = peer.fetch(key)
+            if blob is not None:
+                self.loader.copy_in(dst, blob)
+                peer.note_fetch(time.perf_counter() - t0)
+                return PEER
+            src = PEER_MISS
+        t0 = time.perf_counter()
+        self.loader.load(key, dst)
+        dt = time.perf_counter() - t0
+        self.nvme_load_s = dt if self.nvme_load_s is None else 0.9 * self.nvme_load_s + 0.1 * dt
+        return src
+
+    def load_and_commit(self, key: int, slot: int, from_peer: bool = False) -> str:
         try:
-            self.loader.load(key, self.cache.slab[slot])
+            src = self._fill(key, self.cache.slab[slot], from_peer)
         except BaseException:
             self.cache.abort(key, slot)
             raise
         self.cache.commit(key, slot)
+        return src
 
-    def load_transient(self, key: int) -> torch.Tensor:
+    def load_transient(self, key: int, from_peer: bool = False) -> tuple[torch.Tensor, str]:
         buf = self.transients.get()
         try:
-            self.loader.load(key, buf)
+            src = self._fill(key, buf, from_peer)
         except BaseException:
             self.transients.put(buf)
             raise
-        return buf
+        return buf, src
 
     # ------------------------------------------------------------------ peer link
     def _open_peer(self) -> None:
@@ -219,6 +241,8 @@ class Box:
         if op == "compute":
             with torch.inference_mode():
                 return self.moe.serve_compute(h, tensors)
+        if op == "fetch":
+            return self.moe.serve_fetch(h)
         if op == "bitmap":
             if self.peer is not None:
                 self.peer.receive_bitmap(int(h["epoch"]), int(h["version"]), tensors[0])
@@ -347,6 +371,7 @@ class Box:
                 "nvme_reads": self.reader.reads, "nvme_bytes": self.reader.bytes,
                 "peer_svc_ms_per_expert": (self.peer.svc_per_expert * 1e3
                                            if self.peer is not None and self.peer.svc_per_expert else None),
+                "nvme_ms_per_expert_measured": self.nvme_load_s * 1e3 if self.nvme_load_s else None,
                 "info": self.describe()}
 
     def close(self) -> None:

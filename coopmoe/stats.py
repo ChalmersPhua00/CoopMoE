@@ -7,10 +7,10 @@ from collections import Counter, defaultdict
 
 # Where a routed expert was served from, as seen by the box running the layer.
 LOCAL = "local"          # own cache
-PEER = "peer"            # peer ran it (activations out, partial sums back)
+PEER = "peer"            # copied from the peer's cache over the link, run here
 NVME = "nvme"            # own drive, admitted to own cache
 NVME_TMP = "nvme_tmp"    # own drive, not admitted (prefill, or no slot could be freed)
-PEER_MISS = "peer_miss"  # sent to the peer, which had evicted it: then read from own drive
+PEER_MISS = "peer_miss"  # asked the peer for a copy it no longer held: then read from own drive
 SOURCES = (LOCAL, PEER, NVME, NVME_TMP)
 
 

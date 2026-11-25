@@ -68,7 +68,7 @@ class CacheConfig:
     dup_first: bool = True           # evict experts the peer also holds before exclusive ones
     dup_protect_steps: int = 0       # >0: spare duplicates this box used in its last N decode steps
                                      # (0 = the plain rule: any duplicate goes first)
-    remote_refresh: bool = True      # running an expert for the peer refreshes its LRU position
+    remote_refresh: bool = True      # handing the peer a copy refreshes the expert's LRU position
 
 
 @dataclass
@@ -76,7 +76,8 @@ class LinkConfig:
     enabled: bool = True             # False = two independent boxes: no peer path, no bitmaps
     busy_fallback: bool = True       # read own NVMe when the peer is slower than the drive
     probe_every: int = 32            # while the peer counts as busy, still try it every N layers
-    nvme_ms_per_expert: Optional[float] = None  # busy threshold; default: expert size / 3.9 GB/s
+    nvme_ms_per_expert: Optional[float] = None  # reported only (default: expert size / 3.9 GB/s); the
+                                                # busy test compares measured copy and drive times
 
 
 @dataclass

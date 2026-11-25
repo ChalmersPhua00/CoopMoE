@@ -5,15 +5,17 @@ with HF's routing):
     1. copy the router's top-k ids to the host once
     2. per routed expert, in order of preference:
          own cache  -> run here (pinned so this layer's loads cannot evict it)
-         peer holds -> goes in this layer's single peer message (unless the peer is busy)
-         neither    -> read own NVMe; admit during decode, transient buffer during prefill
-    3. the peer message goes out on the link thread while hits and drive reads run here
-    4. add the peer's partial sums; experts it reports MISS (stale bitmap) are read from
-       own NVMe
+         peer holds -> copy its bytes from the peer's cache over the link (unless the link
+                       is currently slower than this box's drive), then run here
+         neither    -> read own NVMe
+       either way the expert is admitted to this box's cache during decode, and goes to a
+       transient buffer during prefill
+    3. hits run here while the misses load in parallel; an expert the peer no longer holds
+       (stale bitmap) is read from own NVMe
 
-For the peer (serve_compute): run requested experts that are in this box's cache, report the
-rest as MISS. The peer never reads this box's drive on its behalf, and expert weights never
-cross the link.
+For the peer (serve_fetch): hand out the bytes of an expert that is in this box's cache, or
+MISS. The peer never reads this box's drive on its behalf. (serve_compute, the earlier design
+where the peer ran the expert and sent back partial sums, is no longer called.)
 """
 from __future__ import annotations
 
@@ -80,52 +82,32 @@ class MoeExecutor:
 
         peer = box.peer
         use_peer = peer is not None and peer.usable()
-        hits, remote, misses = [], [], []
+        hits, misses = [], []
         for e, ti, w in groups:
             key = self.index.key(layer, e)
             _, st = cache.acquire(key, reserve=False)
             if st is Acquire.HIT:
                 hits.append((key, ti, w))
-            elif use_peer and peer.holds(key):
-                remote.append((e, key, ti, w))
-            else:
-                misses.append((key, ti, w))
-        fut = None
-        if remote:
-            fut = peer.compute_async(layer, remote, x)
+            else:  # copied from the peer's cache if it holds it, else read from own drive
+                misses.append((key, ti, w, use_peer and peer.holds(key)))
         c.add("experts", f"{phase}.{LOCAL}", len(hits))
         c.add("pairs", f"{phase}.{LOCAL}", sum(int(ti.numel()) for _, ti, _ in hits))
         t1 = time.perf_counter()
 
         out = torch.zeros(x.shape[0], self.m.hidden_size, dtype=torch.float32, device=x.device)
         self._run_local(hits, misses, x, out, admit=decode, phase=phase)
-        t2 = time.perf_counter()
-        if fut is not None:
-            needed, partial, miss = fut.result()
-            t3 = time.perf_counter()
-            out.index_add_(0, needed, partial.to(out.device))
-            miss = set(miss)
-            n_ok = len(remote) - len(miss)
-            c.add("experts", f"{phase}.{PEER}", n_ok)
-            c.add("pairs", f"{phase}.{PEER}", sum(int(ti.numel()) for e, _, ti, _ in remote if e not in miss))
-            if miss:
-                c.add("experts", f"{phase}.{PEER_MISS}", len(miss))
-                late = [(key, ti, w) for e, key, ti, w in remote if e in miss]
-                self._run_local([], late, x, out, admit=decode, phase=phase)
-            c.add("time", "peer_wait", t3 - t2)
         c.add("time", f"{phase}.route_plan", t1 - t0)
-        c.add("time", f"{phase}.local", t2 - t1)
+        c.add("time", f"{phase}.local", time.perf_counter() - t1)
         return out.to(x.dtype)
 
     def _run_local(self, hits, misses, x, out, admit: bool, phase: str) -> None:
-        """Hits are already pinned. Misses are read from this box's drive in parallel and run
-        as they land: into a cache slot during decode (admitted), into a transient buffer
-        during prefill or when no slot can be freed."""
+        """Hits are already pinned. Misses are loaded in parallel (the peer's copy over the
+        link, or this box's drive) and run here as they land: into a cache slot during decode
+        (admitted), into a transient buffer during prefill or when no slot can be freed."""
         box, cache = self.box, self.box.cache
         c = box.counters
         pending: dict[Future, tuple] = {}
-        n_nvme = n_tmp = p_nvme = p_tmp = 0
-        for key, ti, w in misses:
+        for key, ti, w, from_peer in misses:
             if admit:
                 slot, st = cache.acquire(key, reserve=True)
                 if st is Acquire.HIT:  # another thread loaded it meanwhile
@@ -134,17 +116,13 @@ class MoeExecutor:
                     c.add("pairs", f"{phase}.{LOCAL}", int(ti.numel()))
                     continue
                 if st is Acquire.RESERVED:
-                    pending[box.reader.submit(box.load_and_commit, key, slot)] = (key, slot, ti, w)
-                    n_nvme += 1
-                    p_nvme += int(ti.numel())
+                    pending[box.reader.submit(box.load_and_commit, key, slot, from_peer)] = (key, slot, ti, w)
                     continue
-            pending[box.reader.submit(box.load_transient, key)] = (key, None, ti, w)
-            n_tmp += 1
-            p_tmp += int(ti.numel())
+            pending[box.reader.submit(box.load_transient, key, from_peer)] = (key, None, ti, w)
         # On an error keep going until every pin and buffer is given back, then raise the first one.
         err: BaseException | None = None
         pinned = []  # released only once the GPU has run every kernel reading them
-        for key, ti, w in hits:  # compute hits while the drive works on the misses
+        for key, ti, w in hits:  # compute hits while the misses load
             pinned.append(key)
             try:
                 if err is None:
@@ -161,28 +139,55 @@ class MoeExecutor:
                     continue
                 if slot is not None:
                     pinned.append(key)
+                    buf, src = cache.slab[slot], res
+                else:
+                    buf, src = res
+                n = int(ti.numel())
+                if src == PEER:
+                    c.add("experts", f"{phase}.{PEER}")
+                    c.add("pairs", f"{phase}.{PEER}", n)
+                else:
+                    if src == PEER_MISS:
+                        c.add("experts", f"{phase}.{PEER_MISS}")
+                    kind = NVME if slot is not None else NVME_TMP
+                    c.add("experts", f"{phase}.{kind}")
+                    c.add("pairs", f"{phase}.{kind}", n)
                 try:
                     if err is None:
-                        self._apply(cache.slab[slot] if slot is not None else res, x, ti, w, out)
+                        self._apply(buf, x, ti, w, out)
                 except BaseException as exc:
                     err = err or exc
                 finally:
                     if slot is None:
-                        _drain()  # a reader thread may be waiting for this buffer to load into it
-                        box.transients.put(res)
+                        _drain()  # a loader thread may be waiting for this buffer
+                        box.transients.put(buf)
         finally:
             _drain()
             for key in pinned:
                 cache.release(key)
         if err is not None:
             raise err
-        if misses:
-            c.add("experts", f"{phase}.{NVME}", n_nvme)
-            c.add("experts", f"{phase}.{NVME_TMP}", n_tmp)
-            c.add("pairs", f"{phase}.{NVME}", p_nvme)
-            c.add("pairs", f"{phase}.{NVME_TMP}", p_tmp)
 
     # ------------------------------------------------------------------ for the peer
+    def serve_fetch(self, h: dict) -> tuple[dict, list]:
+        """The peer copies one expert out of this box's cache: its record's bytes, or MISS."""
+        box, cache = self.box, self.box.cache
+        key = int(h["key"])
+        slot, st = cache.acquire(key, reserve=False, local=False, refresh=box.cfg.cache.remote_refresh,
+                                 wait=False)  # never wait for a load here (cache.py: two boxes would deadlock)
+        if st is not Acquire.HIT:
+            box.counters.add("served", "miss")
+            return {"miss": True}, []
+        try:
+            # A real copy, taken while the slot is pinned: the reply goes out after release(), when
+            # the slot may already hold another expert (.cpu() alone returns the slot itself on a
+            # CPU box). Synchronous.
+            blob = cache.slab[slot][: self.index.expert_bytes].to("cpu", copy=True)
+        finally:
+            cache.release(key)
+        box.counters.add("served", "experts")
+        return {}, [blob]
+
     def serve_compute(self, h: dict, tensors: list) -> tuple[dict, list]:
         box, cache = self.box, self.box.cache
         t0 = time.perf_counter()
@@ -199,7 +204,7 @@ class MoeExecutor:
             try:
                 for e, ti, wi in zip(experts, torch.split(remap, counts), torch.split(w, counts)):
                     key = self.index.key(layer, e)
-                    slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh)
+                    slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh, wait=False)
                     if st is not Acquire.HIT:
                         miss.append(e)
                         continue

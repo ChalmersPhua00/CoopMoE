@@ -2,10 +2,11 @@
 
 > **This is the `baseline` branch.** It is `main` with one change: `"link": {"enabled": false}`
 > in both run configs. Each box keeps the same LRU expert cache (same size) and reads its misses
-> from its own NVMe, but never asks the other box. Same requests on the same boxes, same jobs,
-> same measurement. So the only difference from `main` is the link: with the random split both
-> boxes want the same experts and here hold them independently (the caches overlap as much as
-> the traffic makes them), while on `main` a box can run a miss on the other box's copy.
+> from its own NVMe, but never asks the other box. Same code, same requests on the same boxes,
+> same jobs, same measurement. So the only difference from `main` is the link: with the random
+> split both boxes want the same experts and here hold them independently (the caches overlap as
+> much as the traffic makes them), while on `main` a box that misses copies the expert from the
+> other box's cache when the other box holds it.
 
 Two DGX Spark (GB10) boxes serve concurrent requests to an MoE model that is larger than both
 boxes' memory combined: Qwen3-235B-A22B FP8 has ~227 GB of experts, against 70 GiB of expert
@@ -18,10 +19,9 @@ cache per box (85 did not fit next to the rest in the 120 GiB job).
   There is no scheduler: a request is served on the box the file names, and never moves.
   Duplicate-first eviction keeps the two caches different, so a box's miss is likely to be in
   the other box's memory.
-- **A box that misses asks the other box before its own disk.** The other box runs the expert
-  where it sits, so only kilobytes of activations cross the link.
-
-![CoopMoE architecture](CoopMoE.drawio.png)
+- **A box that misses copies the expert from the other box's cache before it reads its own
+  disk.** The other box only hands out the copy: this box runs the expert itself and keeps it
+  in its own cache, so a miss never makes the other box run an expert.
 
 **Built on Hugging Face transformers (5.23.0).** Each box runs HF's `Qwen3MoeForCausalLM`
 under HF's continuous batching (the loop `transformers serve` uses), with one change: each
@@ -103,18 +103,23 @@ To change the engines (`cache.gb`, link on/off), edit the model's run config in
 ## How a box handles each expert a layer needs
 
 1. **In its own cache:** run it here.
-2. **Only in the other box's cache** (per that box's last residency bitmap): send it in this
-   layer's single message to the other box, which runs it and sends back the partial result.
-   - If the other box evicted it meanwhile, it replies `MISS` and this box reads it from disk.
-   - If the other box is slower per expert than a disk read, read from disk instead (and
-     re-check every 32 layers).
-3. **In neither:** read it from this box's disk and run it. While generating it is admitted to
-   the cache; while reading the prompt it goes to a temporary buffer, so a prompt does not
-   flush the cache.
+2. **Only in the other box's cache** (per that box's last residency bitmap): copy the
+   expert's bytes out of the other box's cache over the CX-7 link, then run it here.
+   - If the other box evicted it meanwhile (or is still reading it in), it replies `MISS` and
+     this box reads it from disk.
+   - If a copy from the other box currently takes longer than a read from this box's disk
+     (both are timed as they happen), read from disk instead, and try the other box again
+     every 32 layers.
+3. **In neither:** read it from this box's disk and run it.
 
-Expert weights never cross the link: only activations and partial results do (kilobytes per
-layer), which is why asking the other box beats this box's own NVMe. An expert's bytes only
-ever come from a box's own disk.
+Wherever a missed expert came from, it is admitted to this box's cache while generating; while
+reading a prompt it goes to a temporary buffer instead, so a prompt does not flush the cache.
+A layer's misses load in parallel (`reader.threads`, 8) while its hits run.
+
+Expert weights cross the link: one copy per miss (18.9 MB per expert for 235B, 4.7 MB for
+30B), plus the residency bitmaps. The bet is that the other box's memory, over the CX-7 link,
+delivers an expert faster than this box's own NVMe. The other box never reads its disk for
+this box, and never runs an expert for it: it only hands out what is already in its cache.
 
 One rule sits on top of the LRU cache: duplicate-first eviction (`cache.dup_first`, on). An
 expert the other box also holds is evicted before one only this box holds.
@@ -147,9 +152,9 @@ fuzzball/           stage.fz, coopmoe.fz (job templates), bootstrap.sh (what eac
 coopmoe/            the engine, run inside the jobs as python -m coopmoe stage | engine | run
   run.py            the experiment on PGX-A: engine, each request to its box, report
   engine.py         one box: HF continuous batching, step hooks, message server
-  moe.py            per expert: own cache / other box / own disk, and serving the other box
+  moe.py            per expert: own cache / other box / own disk, and copies for the other box
   cache.py          the LRU expert cache, duplicate-first eviction, residency bitmap
-  peer.py           the link to the other box (activations and residency bitmaps only)
+  peer.py           the link to the other box (expert copies and residency bitmaps)
   model.py          HF Qwen3-MoE with each layer's experts swapped for CoopMoE's
   store/            store format, checkpoint -> store converter, fast disk reader
   transport.py      TCP messages; bench.py: per-box queues (--concurrency at a time) and
