@@ -1,9 +1,10 @@
 """This box's side of the link to the other box: a miss the peer holds is copied from the
 peer's cache (fetch) and run here.
 
-PeerLink: per-layer compute requests (one message per MoE layer, activations out, partial sums
-back), residency-bitmap pushes, and the busy-peer estimate. Only activations and bitmaps cross
-the link, never expert weights: an expert's bytes come from a box's own NVMe only.
+PeerLink: expert copies (fetch: one connection per loader thread, the expert's bytes back),
+residency-bitmap pushes, and the busy-peer estimate (is a copy from the peer currently slower
+than a read from this box's drive?). Expert weights and bitmaps cross the link. compute_async
+(activations out, the peer's partial sums back) is the earlier design and is no longer called.
 """
 from __future__ import annotations
 

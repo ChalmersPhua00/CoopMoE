@@ -1,7 +1,7 @@
 """One box's expert cache: a single plain LRU over fixed-size slots, plus duplicate-first eviction.
 
 There are no hot / warm / cold tiers. What a box holds is whatever its own traffic (and the
-experts it runs for its peer) keeps recent. One rule sits on top:
+copies it hands to its peer) keeps recent. One rule sits on top:
 
   duplicate-first eviction   when a slot is needed, an expert the peer also holds (per the
                              peer's last residency bitmap) goes before any expert only this
@@ -13,9 +13,12 @@ Bookkeeping is per (layer, expert) key in numpy arrays, so picking a victim is o
 pass over 12,032 keys for Qwen3-235B. Experts are read-only, so a stale view of the peer
 never gives a wrong answer, only a different eviction choice.
 
-Concurrency: the engine thread, the peer-server thread, the drive readers and the admission
-thread all use the cache. A key is pinned while anyone computes on it or loads into it, and
-pinned keys are never evicted. Two threads asking for the same missing expert share one load.
+Concurrency: the engine thread, the server threads (the peer's fetches) and the loader threads
+all use the cache. A key is pinned while anyone computes on it, copies it or loads into it,
+and pinned keys are never evicted. Two of this box's threads asking for the same missing
+expert share one load. The peer's fetches never wait for a load (wait=False): two boxes that
+both evicted a shared expert and fetch it from each other would otherwise wait on each other
+forever.
 """
 from __future__ import annotations
 
@@ -105,9 +108,10 @@ class ExpertCache:
             self.last_step[key] = self.step
 
     def acquire(self, key: int, reserve: bool = True, local: bool = True,
-                refresh: bool = True) -> tuple[Optional[int], Acquire]:
+                refresh: bool = True, wait: bool = True) -> tuple[Optional[int], Acquire]:
         """Pin `key` if resident (HIT). Otherwise, with reserve=True, take a slot for the caller
         to load into (RESERVED), evicting if needed; MISS if not resident and nothing reserved.
+        A key another thread is loading is waited for, unless wait=False (then MISS).
         local=False marks a use on behalf of the peer: it refreshes LRU recency (if `refresh`)
         but does not count as this box's own use for duplicate protection."""
         while True:
@@ -118,6 +122,8 @@ class ExpertCache:
                         self._touch(key, local)
                     return int(self.slot_of[key]), Acquire.HIT
                 pending = self._loading.get(key)
+                if pending is not None and not wait:
+                    return None, Acquire.MISS
                 if pending is None:
                     if not reserve:
                         return None, Acquire.MISS

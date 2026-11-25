@@ -173,12 +173,16 @@ class MoeExecutor:
         """The peer copies one expert out of this box's cache: its record's bytes, or MISS."""
         box, cache = self.box, self.box.cache
         key = int(h["key"])
-        slot, st = cache.acquire(key, reserve=False, local=False, refresh=box.cfg.cache.remote_refresh)
+        slot, st = cache.acquire(key, reserve=False, local=False, refresh=box.cfg.cache.remote_refresh,
+                                 wait=False)  # never wait for a load here (cache.py: two boxes would deadlock)
         if st is not Acquire.HIT:
             box.counters.add("served", "miss")
             return {"miss": True}, []
         try:
-            blob = cache.slab[slot][: self.index.expert_bytes].cpu()  # synchronous
+            # A real copy, taken while the slot is pinned: the reply goes out after release(), when
+            # the slot may already hold another expert (.cpu() alone returns the slot itself on a
+            # CPU box). Synchronous.
+            blob = cache.slab[slot][: self.index.expert_bytes].to("cpu", copy=True)
         finally:
             cache.release(key)
         box.counters.add("served", "experts")
@@ -200,7 +204,7 @@ class MoeExecutor:
             try:
                 for e, ti, wi in zip(experts, torch.split(remap, counts), torch.split(w, counts)):
                     key = self.index.key(layer, e)
-                    slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh)
+                    slot, st = cache.acquire(key, reserve=False, local=False, refresh=refresh, wait=False)
                     if st is not Acquire.HIT:
                         miss.append(e)
                         continue

@@ -1,4 +1,4 @@
-"""One PGX box: serves its own requests and runs the other box's misses on experts it holds.
+"""One PGX box: serves its own requests, and hands the other box copies of experts in its cache.
 
 State on a box:
     non-expert weights   resident, never evicted (both boxes run attention)
@@ -14,13 +14,14 @@ new token per request: misses are admitted to the cache) or contains prompt toke
 a transient buffer); after it, the step count and a residency-bitmap push if the cache changed.
 
 Threads: HF's generation loop, a result thread (hands finished requests back, pushes the bitmap
-while idle), one server thread per connection (bench turns block until done; peer requests
-run immediately, on their own CUDA stream), drive readers, the link thread and the admission
-thread.
+while idle), one server thread per connection (bench turns block until done; the other box's
+fetches are answered right away, from this box's cache), the loader threads (a miss: a copy
+from the other box, or a read from this box's drive) and the link thread (bitmap pushes).
 
 Ops (TcpServer -> Box.handle):
     bench:  turn, quiesce, reset, reset_counters, state, stats, ping, shutdown
-    peer:   fetch, bitmap
+    peer:   fetch, bitmap   (compute: the earlier design where the other box ran the expert;
+                             this version never sends it)
 """
 from __future__ import annotations
 
@@ -72,7 +73,7 @@ class Box:
         self.moe = MoeExecutor(self)
         self.model = hf_model.build(cfg.store_dir, self.moe, self.device, self.dtype)
         self.counters = Counters()
-        self.peer_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None
+        self.peer_stream = torch.cuda.Stream(device=self.device) if self.device.type == "cuda" else None  # serve_compute only
         self.peer: Optional[PeerLink] = None
         self.nvme_load_s: Optional[float] = None  # measured seconds per expert read from the drive
         self.epoch = 0
